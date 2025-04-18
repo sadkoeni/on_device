@@ -7,6 +7,9 @@ import json # Added json
 import uuid # Added for device ID
 import os.path # Added for device ID file path
 import aiohttp # Added for async HTTP requests
+#import keyboard # Added for listening to key presses - REMOVED
+import hid # Added for HID device communication
+import threading # Added for background listener thread
 # from dotenv import load_dotenv # For API keys - No longer needed for token/room
 from datetime import datetime # Added import
 import sys # Import sys for stderr redirection
@@ -32,6 +35,14 @@ DEVICE_ID = os.getenv("DEVICE_ID", "rec0BGngnqiV7Nkl2")
 #LIVEKIT_ROOM_NAME="lightberry"
 LIVEKIT_URL="wss://lb-ub8o0q4v.livekit.cloud"
 TIMING_LOG_DIR="timing_logs"
+# --- HID Device Configuration ---
+ADAFRUIT_VID = 0x239A
+# !!! IMPORTANT: Replace 0xXXXX with your NeoKey Trinkey's actual Product ID (PID) !!!
+TRINKEY_PID = 0x8100 # PID when HID keyboard is active
+# !!! IMPORTANT: Replace this with the exact HID report byte sequence your Trinkey sends !!!
+# Example: F24 key (0x3d) with no modifiers in an 8-byte report
+TRINKEY_KEYCODE = bytes([1, 0, 0, 115, 0, 0, 0, 0, 0])
+# --- End HID Device Configuration ---
 
 logger = logging.getLogger("LightberryLocalClient")
 logger.info(f"Using standard audio sample rate: {LIVEKIT_SAMPLE_RATE}Hz") # Use standard rate
@@ -78,6 +89,101 @@ async def get_credentials(device_id: str, username: str) -> tuple[Optional[str],
     except Exception as e:
         logger.error(f"An unexpected error occurred during credential fetching: {e}", exc_info=True)
         return None, None
+
+# --- HID Listener Functions (Moved to Module Scope) ---
+def find_trinkey_path(vid: int, pid: int) -> Optional[str]:
+    """Finds the HID device path for the given VID and PID."""
+    try:
+        devices = hid.enumerate(vid, pid)
+        if not devices:
+            logger.warning(f"No HID device found with VID={vid:#06x}, PID={pid:#06x}")
+            return None
+        # Prefer devices with a usage page/id if possible, but take the first found for now
+        # You might need more specific filtering if multiple interfaces exist
+        device_path = devices[0]['path']
+        logger.info(f"Found Trinkey HID device at path: {device_path.decode('utf-8') if device_path else 'N/A'}")
+        return device_path
+    except ImportError:
+        logger.error("hidapi library not found or failed to import. Install it: pip install hidapi")
+        return None
+    except Exception as e:
+        logger.error(f"Error enumerating HID devices: {e}")
+        return None
+
+def trinkey_listener_thread(loop: asyncio.AbstractEventLoop,
+                           stop_event: asyncio.Event,
+                           restart_event: asyncio.Event,
+                           device_path: bytes,
+                           target_keycode: bytes):
+   """Listens for HID reports from the Trinkey in a separate thread."""
+   last_press_time = 0.0
+   press_count = 0 # Counter for consecutive presses
+   PRESS_TIMEOUT = 2.0 # Seconds to consider presses consecutive
+
+   trinkey_dev = None
+   logger.info(f"HID Listener: Thread started for device {device_path.decode('utf-8')}")
+   try:
+       trinkey_dev = hid.device()
+       trinkey_dev.open_path(device_path)
+       trinkey_dev.set_nonblocking(1) # Use non-blocking reads
+       logger.info("HID Listener: Device opened successfully.")
+
+       while not stop_event.is_set():
+           report = trinkey_dev.read(64) # Read up to 64 bytes
+           if report:
+               # --- Log ALL received reports for debugging ---
+               logger.info(f"HID Listener: Received raw report: {list(report)}")
+               # --- End Debug Log ---
+
+               # Check for the key down report specifically
+               if bytes(report) == target_keycode:
+                   current_time = time.time()
+                   time_elapsed = current_time - last_press_time
+
+                   logger.info(f"HID Listener: Matched keycode received at {current_time} (elapsed: {time_elapsed:.2f}s)")
+
+                   # Reset count if timeout exceeded or first press
+                   if time_elapsed > PRESS_TIMEOUT or press_count == 0:
+                       press_count = 1
+                       logger.info(f"HID Listener: Press sequence started (count={press_count}).")
+                   else:
+                       # Increment count for consecutive press
+                       press_count += 1
+                       logger.info(f"HID Listener: Consecutive press detected (count={press_count}).")
+
+                   # Update last press time
+                   last_press_time = current_time
+
+                   # --- Check press count and signal events ---
+                   if press_count == 2:
+                       logger.info("HID Listener: Double press detected. Signaling restart.")
+                       # Ensure stop isn't accidentally set from a previous quick sequence
+                       # loop.call_soon_threadsafe(stop_event.clear) # Probably not needed, but for safety
+                       loop.call_soon_threadsafe(restart_event.set)
+                       # Do not reset press_count here, wait for potential third press
+                   elif press_count == 5:
+                       logger.warning("HID Listener: Triple press detected! Signaling stop.")
+                       # loop.call_soon_threadsafe(restart_event.clear) # No need to clear restart if stopping
+                       loop.call_soon_threadsafe(stop_event.set)      # Signal full stop
+                       break # Exit listener thread
+                   # If press_count is 1, do nothing, wait for next press
+
+               # else: logger.debug(f"HID report: {list(report)}") # Optional: Log other reports
+
+           # Small sleep to prevent busy-waiting
+           time.sleep(0.02)
+
+   except OSError as e:
+       # Catch permission errors or device disconnects during read/open
+       logger.error(f"HID Listener: OSError: {e} - Check permissions (run with sudo?) or device connection.")
+   except Exception as e:
+       logger.error(f"HID Listener: Unexpected error: {e}", exc_info=True)
+   finally:
+       if trinkey_dev:
+           trinkey_dev.close()
+           logger.info("HID Listener: Device closed.")
+       logger.info("HID Listener: Thread finished.")
+# --- End HID Listener Functions ---
 
 class AudioIOHandler(IOHandlerInterface): # Implements IOHandlerInterface for Audio
     """Manages interaction with audio input/output components and state, including input pausing."""
@@ -1053,7 +1159,7 @@ class LocalIOHandler(AudioIOHandler):
     
 
 class LightberryLocalClient:
-    def __init__(self, url: str, token: str, room_name: str, loop: asyncio.AbstractEventLoop):
+    def __init__(self, url: str, token: str, room_name: str, loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event):
         self.livekit_url = url
         self.livekit_token = token
         self.room_name = room_name # Though token usually defines the room
@@ -1091,7 +1197,7 @@ class LightberryLocalClient:
         self._mic_track_pub: Optional[rtc.LocalTrackPublication] = None
         self._forward_mic_task: Optional[asyncio.Task] = None
         self._playback_tasks: dict[str, asyncio.Task] = {} # track_sid -> playback task
-        self._stop_event = asyncio.Event()
+        self._stop_event = stop_event # Use the passed-in event
         # --- Event to signal mic source is ready ---
         self._mic_source_ready = asyncio.Event()
         logger.info(f"LightberryLocalClient initialized. Timing logs will be saved to '{self.timing_log_file_path}'")
@@ -1114,6 +1220,7 @@ class LightberryLocalClient:
             self._register_listeners() # Register listeners before connecting
             await self._room.connect(self.livekit_url, self.livekit_token)
             logger.info(f"Successfully connected to LiveKit room: {self._room.name} (SID: {await self._room.sid})")
+            
         except rtc.ConnectError as e:
             logger.error(f"Failed to connect to LiveKit room: {e}", exc_info=True)
             self._room = None # Ensure room is None on failure
@@ -1248,10 +1355,35 @@ class LightberryLocalClient:
             logger.info(f"Starting microphone forwarding loop with timing (Expecting {bytes_per_frame}-byte frames)")
             await self._local_io_handler._clear_input_buffers() # Clear any buffered input
             self._local_io_handler._pause_input_event.set() # Start unpaused
-            while True:
+            while not self._stop_event.is_set(): # Check stop event at loop start
                 try:
-                    # Get chunk, ID, and put_time from IO Handler's internal queue
-                    chunk_data, chunk_id, t_put_internal_q = await asyncio.wait_for(internal_queue.get(), timeout=1.0)
+                    # Wait for either a queue item OR the stop event, whichever comes first
+                    get_task = asyncio.create_task(internal_queue.get(), name="MicForwarderGetQueue")
+                    stop_task = asyncio.create_task(self._stop_event.wait(), name="MicForwarderStopWait")
+                    done, pending = await asyncio.wait(
+                        [get_task, stop_task],
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+
+                    # Check if stop event was triggered
+                    if stop_task in done:
+                        logger.info("Stop event detected during queue wait, exiting mic forward loop.")
+                        if not get_task.done(): get_task.cancel() # Cancel the pending queue get
+                        break
+
+                    # If stop wasn't triggered, the queue task must be done
+                    if get_task not in done:
+                        # This shouldn't happen with FIRST_COMPLETED, but handle defensively
+                        logger.error("Mic forward loop state error: Queue get task not done?")
+                        if not stop_task.done(): stop_task.cancel()
+                        break
+
+                    # Stop task wasn't done, cancel it
+                    if not stop_task.done(): stop_task.cancel()
+
+                    # Get the result from the completed get_task
+                    chunk_data, chunk_id, t_put_internal_q = get_task.result()
+
                     t_get_internal_q = time.time()
                     internal_queue.task_done()
                     
@@ -1449,24 +1581,108 @@ async def main():
     # logger.info(f"User ID: {USER_ID}") # User ID is now part of token generation
     logger.info("Attempting to run client...")
     
+    # Create the shared stop event *before* client creation
+    stop_event = asyncio.Event()
+    # Create a separate event for restart requests
+    restart_event = asyncio.Event()
+
     client = None # Initialize client to None for finally block
+    listener_thread = None # Initialize listener thread variable
+
     try:
-        # Get the running loop (guaranteed to exist by asyncio.run)
-        loop = asyncio.get_running_loop() 
-        # Create the client instance, passing the fetched credentials and loop
-        client = LightberryLocalClient(LIVEKIT_URL, token, room_name, loop) # Use fetched token and room_name
-        # Start the client
-        await client.start()
-        # Keep the main function alive while the client runs
-        # This assumes _stop_event is accessible or we wait indefinitely
-        await client._stop_event.wait() 
-        logger.info("Client stop event received in main.")
+        loop = asyncio.get_running_loop()
+
+        # --- Start Listener Thread (runs continuously in background) ---
+        trinkey_path = find_trinkey_path(ADAFRUIT_VID, TRINKEY_PID) # Now calls module-level function
+        if trinkey_path:
+            # Pass both stop and restart events to the listener
+            listener_thread = threading.Thread(
+                target=trinkey_listener_thread, # Now calls module-level function
+                args=(loop, stop_event, restart_event, trinkey_path, TRINKEY_KEYCODE),
+                daemon=True, # Allow program to exit even if thread is stuck
+                name="TrinkeyListener"
+            )
+            listener_thread.start()
+        else:
+            logger.warning("Trinkey device not found. Restart/Exit feature disabled.")
+        # --- End HID Listener Setup ---
+
+        # --- Main Client Loop ---
+        while not stop_event.is_set():
+            client = None # Ensure client is reset each loop
+            try:
+                restart_event.clear() # Clear restart flag for this run
+                logger.info("(Re)Starting client pipeline...")
+                # Create the client instance, passing the MAIN stop_event
+                client = LightberryLocalClient(LIVEKIT_URL, token, room_name, loop, stop_event)
+                await client.start() # Sets up connections, publishes track, starts tasks
+
+                logger.info("Client running. Waiting for stop or restart signal...")
+                # Wait for either the listener to signal stop/restart, or an internal client disconnect (which also sets stop_event)
+                done, pending = await asyncio.wait(
+                    # Wrap event waits in tasks
+                    [asyncio.create_task(stop_event.wait(), name="WaitForStop"),
+                     asyncio.create_task(restart_event.wait(), name="WaitForRestart")],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+
+                # Cancel the pending wait task (the one that didn't complete)
+                for task in pending:
+                    task.cancel()
+                    try:
+                        await task # Allow cancellation to propagate
+                    except asyncio.CancelledError:
+                        pass # Expected cancellation
+
+                if restart_event.is_set():
+                    logger.warning("Restart event received from listener. Stopping current client...")
+                    if client:
+                        await client.stop() # Gracefully stop the current client
+                    logger.info("Client stopped. Looping to restart...")
+                    # Optional: short delay before restarting
+                    # await asyncio.sleep(1)
+                    continue # Continue to the next iteration of the while loop to restart
+
+                # If stop_event was set, the loop condition handles exit, but stop client first
+                if stop_event.is_set():
+                    logger.warning("Stop event received. Stopping client...")
+                    if client:
+                        await client.stop()
+                    break # Exit the while loop
+
+            except Exception as loop_exception:
+                logger.error(f"Error within main client run loop: {loop_exception}", exc_info=True)
+                logger.info("Attempting to stop client and restart after error...")
+                if client:
+                    try:
+                        await client.stop()
+                    except Exception as stop_err:
+                         logger.error(f"Error stopping client after loop error: {stop_err}", exc_info=True)
+                await asyncio.sleep(5) # Wait a bit before retrying
+                continue # Attempt to restart the loop
+            # Note: No finally block needed here inside the loop as client.stop is handled for restart/stop cases
+
+        logger.info("Stop event set or loop exited. Proceeding to final shutdown.")
+
     except Exception as e:
-         logger.error(f"An error occurred during client execution in main: {e}", exc_info=True)
+        # Catch errors during initial setup (before the main loop starts)
+        logger.error(f"An error occurred during initial client setup: {e}", exc_info=True)
     finally:
-        logger.info("Main function initiating shutdown...")
-        if client:
-            await client.stop()
+        logger.info("Main function initiating final shutdown...")
+        # Optional: Wait briefly for the listener thread to exit if it was started
+        # The primary stop mechanism is the stop_event check within the thread loop
+        # and the fact that it's a daemon thread.
+        if listener_thread and listener_thread.is_alive():
+            logger.info("Waiting briefly for listener thread to exit...")
+            # No need to join daemon thread usually, but can if desired
+            # listener_thread.join(timeout=1.0)
+
+        # Final attempt to stop client if it was somehow still assigned and loop exited abnormally
+        # This is less likely with the loop structure but safe to include.
+        # if client: # Client variable is local to the while loop now
+        #    logger.info("Performing final client stop check...")
+        #    await client.stop()
+
         logger.info("Main function shutdown complete.")
 
 if __name__ == "__main__":

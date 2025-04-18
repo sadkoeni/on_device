@@ -1,0 +1,13 @@
+[Unit]
+Description=Lightberry Standalone Client Service
+After=network.target # Or potentially network-online.target if it needs network immediately
+
+[Service]
+User=lightberry-01
+WorkingDirectory=/home/lightberry-01/lb
+ExecStart=/home/lightberry-01/lb/venv/bin/python /home/lightberry-01/lb/standalone_client.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
