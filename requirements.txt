@@ -4,4 +4,7 @@ hidapi
 livekit
 livekit-api
 sounddevice
+websockets
+websocket-client
+requests>=2.25.1
 PyAudio
