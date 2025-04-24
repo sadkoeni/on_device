@@ -24,7 +24,7 @@ sudo cp btwifiset.service /etc/systemd/system/ || { echo "Failed to copy bt-wifi
 sudo cp gitpull.service /etc/systemd/system/ || { echo "Failed to copy gitpull.service. Exiting."; exit 1; }
 
 echo "installing bt wifi setup"
-sudo apt install -y python3 python3-pip bluetooth bluez python3-dbus || { echo "Failed to install btwifi setup dependencies. Exiting."; exit 1;}
+sudo apt install -y python3 python3-pip bluetooth bluez python3-dbus || { echo "Failed to install btwifi setup dependencies. Exiting."; exit 1; }
 
 echo "downloading bt-wifi setup"
 curl  -L https://raw.githubusercontent.com/nksan/Rpi-SetWiFi-viaBluetooth/main/btwifisetInstall.sh | bash
