@@ -1,0 +1,7 @@
+numpy
+aiohttp
+hidapi
+livekit
+livekit-api
+sounddevice
+PyAudio

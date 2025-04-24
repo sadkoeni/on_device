@@ -36,9 +36,9 @@ except Exception as e:
 logger.info("Opening device to check reports...")
 device = None
 try:
-    device = hid.device()
-    device.open_path(device_path)
-    device.set_nonblocking(1) # Use non-blocking reads
+    device = hid.device(DEVICE_VID, DEVICE_PID)
+    # This constructor likely opens the device, so open_path might not be needed/valid
+    #device.set_nonblocking(1) # Use non-blocking reads
     logger.info("Device opened. Press the key on the device... (Ctrl+C to exit)")
     print("Listening...")
 
@@ -65,4 +65,4 @@ except Exception as e:
 finally:
     if device:
         device.close()
-        logger.info("Device closed.") 
+        logger.info("Device closed.") !/usr/bin/env python3
