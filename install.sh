@@ -3,6 +3,7 @@ sudo apt-get update || { echo "apt-get update failed. Exiting."; exit 1; }
 
 echo "Installing Portaudio (dependency for pyaudio and sounddevice)"
 sudo apt-get install -y portaudio19-dev || { echo "Failed to install portaudio19-dev. Exiting."; exit 1; }
+sudo apt-get install -y build-essential python3-dev portaudio19-dev || {echo "Failed to install python3-dev. Exiiting."; exit 1; }
 echo "Installed successfully"
 echo "creating virtual environment"
 python -m venv venv
