@@ -31,7 +31,7 @@ from constants import LIVEKIT_SAMPLE_RATE, PYAUDIO_CHUNK_SIZE, PYAUDIO_CHANNELS,
 
 ASSISTANT_IDENTITY = os.getenv("ASSISTANT_IDENTITY", "assistant")
 ASSISTANT_ROOM_NAME = os.getenv("LIVEKIT_ROOM_NAME", "lightberry")
-DEVICE_ID = os.getenv("DEVICE_ID", "rec0BGngnqiV7Nkl2")
+DEVICE_ID = os.getenv("DEVICE_ID", "rechavpPa8YyWv7Zn")
 #LIVEKIT_ROOM_NAME="lightberry"
 LIVEKIT_URL="wss://lb-ub8o0q4v.livekit.cloud"
 TIMING_LOG_DIR="timing_logs"
