@@ -2128,7 +2128,7 @@ async def main():
 
                 print("Waiting for the first trigger press (Spacebar or Trinkey)...", flush=True)
                 logger.info("Clearing potential stale events from trigger queue...")
-                while not trigger_event_queue.empty():
+                """while not trigger_event_queue.empty():
                     try:
                         stale_event = trigger_event_queue.get_nowait()
                         logger.warning(f"Discarding stale event from queue before wait: {stale_event.name}")
@@ -2153,14 +2153,14 @@ async def main():
                         # Keep listener active
                     else:
                         logger.warning(f"Unexpected event '{event.name}' received in IDLE state. Ignoring.")
-
+                
                 except asyncio.CancelledError:
                     logger.info("IDLE state wait cancelled.")
                     current_state = AppState.STOPPING
                 except Exception as e:
                     logger.error(f"Error waiting for trigger event in IDLE state: {e}", exc_info=True)
-                    await asyncio.sleep(1) # Pause before retry (loop continues)
-
+                    await asyncio.sleep(1) # Pause before retry (loop continues)"""
+                current_state = AppState.CONNECTING
             elif current_state == AppState.CONNECTING:
                 print(">>> Current State: CONNECTING <<<", flush=True)
                 logger.info("Entered CONNECTING state.")
