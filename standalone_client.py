@@ -276,8 +276,8 @@ class WakeWordTrigger(TriggerController):
                  loop: asyncio.AbstractEventLoop,
                  event_queue: asyncio.Queue,
                  io_handler: 'LocalIOHandler', # Reference to the IO Handler
-                 activation_word: str = "hey_mycroft", # Default activation word
-                 stop_word: str = "hey_jarvis",        # Default stop word (maps to double press)
+                 activation_word: str = "lightberry",        # Changed default activation word
+                 stop_word: str = "lightberry_restart",    # Changed default stop word
                  threshold: float = 0.5):
         super().__init__(loop, event_queue)
         self.io_handler = io_handler
@@ -304,9 +304,17 @@ class WakeWordTrigger(TriggerController):
         self._last_detection_time: float = 0.0 # Initialize refractory timer
 
         try:
-            self.logger.info("Initializing openWakeWord model...")
-            # Using ONNX by default, assuming it's generally available/performant
-            self.oww_model = Model(inference_framework='onnx')
+            self.logger.info("Initializing openWakeWord model with specific custom models...")
+            # Use ONNX framework and specify only the required models by path
+            inference_framework = 'onnx'
+            custom_model_paths = [
+                f"wakeword_models/lightberry.{inference_framework}", 
+                f"wakeword_models/lightberry_restart.{inference_framework}"
+            ]
+            self.oww_model = Model(
+                wakeword_models=custom_model_paths,
+                inference_framework=inference_framework
+            )
             model_keys = list(self.oww_model.models.keys())
             self.logger.info(f"Loaded openWakeWord models: {model_keys}")
 
@@ -371,18 +379,29 @@ class WakeWordTrigger(TriggerController):
 
                         # --- Emit Events --- #
                         current_time = time.time()
-                        if current_time - self._last_detection_time > 1.0: # 1-second refractory period
-                            if activation_score > self.threshold:
-                                self.logger.info(f"Activation word '{self.activation_word}' detected (Score: {activation_score:.2f}). Emitting FIRST_PRESS.")
-                                self._emit_event(TriggerEvent.FIRST_PRESS)
-                                self._last_detection_time = current_time # Update timestamp
-                            elif stop_score > self.threshold:
+
+                        # Check for STOP word first, independently of refractory period
+                        if stop_score > self.threshold:
+                            # Check if enough time passed since the *last stop* detection to avoid spamming stops
+                            # (Using a shorter refractory for stop, e.g., 0.5s, or potentially none)
+                            # For simplicity, let's use the same timer but check it separately.
+                            # We only want to emit STOP if not recently activated OR stopped.
+                            # Re-evaluate this logic if stop needs to be immediate after activation.
+                            if True: #current_time - self._last_detection_time > 1.0: # dont Re-use timer for now
                                 self.logger.info(f"Stop word '{self.stop_word}' detected (Score: {stop_score:.2f}). Emitting DOUBLE_PRESS.")
                                 self._emit_event(TriggerEvent.DOUBLE_PRESS)
                                 self._last_detection_time = current_time # Update timestamp
-                        # else: # Optional: Log if detection ignored due to refractory period
-                        #     if activation_score > self.threshold or stop_score > self.threshold:
-                        #          self.logger.debug("Wake word detected but ignored due to refractory period.")
+                            else:
+                                 self.logger.debug(f"Stop word '{self.stop_word}' detected but ignored due to refractory period.")
+                        
+                        # Check for ACTIVATION word, applying the refractory period
+                        elif activation_score > self.threshold:
+                             if current_time - self._last_detection_time > 1.0: # Refractory check specific to activation
+                                self.logger.info(f"Activation word '{self.activation_word}' detected (Score: {activation_score:.2f}). Emitting FIRST_PRESS.")
+                                self._emit_event(TriggerEvent.FIRST_PRESS)
+                                self._last_detection_time = current_time # Update timestamp
+                             else:
+                                 self.logger.debug(f"Activation word '{self.activation_word}' detected but ignored due to refractory period.")
 
                 except Exception as pred_err:
                      log_chunk_id = chunk_id if 'chunk_id' in locals() else 'unknown'
