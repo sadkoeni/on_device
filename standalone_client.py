@@ -301,6 +301,7 @@ class WakeWordTrigger(TriggerController):
         self.stop_word = stop_word
         self.threshold = threshold
         self.oww_model: Optional[Model] = None
+        self._last_detection_time: float = 0.0 # Initialize refractory timer
 
         try:
             self.logger.info("Initializing openWakeWord model...")
@@ -345,11 +346,23 @@ class WakeWordTrigger(TriggerController):
                     # Convert raw bytes (assuming int16 @ 48kHz) to numpy array
                     audio_int16_48k = np.frombuffer(chunk_data, dtype=np.int16)
 
-                    # --- Using 48kHz directly initially --- #
-                    audio_to_predict = audio_int16_48k
-                    # -------------------------------------- #
+                    # --- Downsample using resampy --- #
+                    audio_int16_16k = np.array([], dtype=np.int16) # Default to empty
+                    if audio_int16_48k.size > 0:
+                        # Convert int16 to float32 for resampy
+                        audio_float_48k = audio_int16_48k.astype(np.float32) / 32768.0
+                        try:
+                            # Resample (using kaiser_fast for potentially better performance)
+                            audio_float_16k = resampy.resample(audio_float_48k, sr_orig=LIVEKIT_SAMPLE_RATE, sr_new=16000, filter='kaiser_fast')
+                            # Convert back to int16 for openwakeword
+                            audio_int16_16k = (audio_float_16k * 32768.0).astype(np.int16)
+                        except Exception as resample_err:
+                             self.logger.error(f"Error during resampling chunk {chunk_id}: {resample_err}")
+                             # audio_int16_16k remains empty on error
+                    # --------------------------------- #
 
-                    # Predict using the audio chunk
+                    # Predict using the downsampled audio chunk
+                    audio_to_predict = audio_int16_16k # Use the resampled data
                     if audio_to_predict.size > 0:
                         self.oww_model.predict(audio_to_predict)
                         scores = self.oww_model.prediction_buffer
@@ -357,14 +370,19 @@ class WakeWordTrigger(TriggerController):
                         stop_score = scores.get(self.stop_word, [0.0])[-1]
 
                         # --- Emit Events --- #
-                        if activation_score > self.threshold:
-                            self.logger.info(f"Activation word '{self.activation_word}' detected (Score: {activation_score:.2f}). Emitting FIRST_PRESS.")
-                            self._emit_event(TriggerEvent.FIRST_PRESS)
-                            # time.sleep(0.2) # Refractory period - ADD LATER IF NEEDED
-                        elif stop_score > self.threshold:
-                            self.logger.info(f"Stop word '{self.stop_word}' detected (Score: {stop_score:.2f}). Emitting DOUBLE_PRESS.")
-                            self._emit_event(TriggerEvent.DOUBLE_PRESS)
-                            # time.sleep(0.2) # Refractory period - ADD LATER IF NEEDED
+                        current_time = time.time()
+                        if current_time - self._last_detection_time > 1.0: # 1-second refractory period
+                            if activation_score > self.threshold:
+                                self.logger.info(f"Activation word '{self.activation_word}' detected (Score: {activation_score:.2f}). Emitting FIRST_PRESS.")
+                                self._emit_event(TriggerEvent.FIRST_PRESS)
+                                self._last_detection_time = current_time # Update timestamp
+                            elif stop_score > self.threshold:
+                                self.logger.info(f"Stop word '{self.stop_word}' detected (Score: {stop_score:.2f}). Emitting DOUBLE_PRESS.")
+                                self._emit_event(TriggerEvent.DOUBLE_PRESS)
+                                self._last_detection_time = current_time # Update timestamp
+                        # else: # Optional: Log if detection ignored due to refractory period
+                        #     if activation_score > self.threshold or stop_score > self.threshold:
+                        #          self.logger.debug("Wake word detected but ignored due to refractory period.")
 
                 except Exception as pred_err:
                      log_chunk_id = chunk_id if 'chunk_id' in locals() else 'unknown'
@@ -893,9 +911,10 @@ class PyAudioMicrophoneInput(AudioInputInterface):
                     try:
                         if self._get_chunk_id:
                             chunk_id = self._get_chunk_id()
-                        else:
-                            self.logger.warning("Chunk ID callback missing, cannot get ID.")
+                        # else: # Callback missing - chunk_id remains -1
+                        #     pass
 
+                        # Log mic capture time if timing callback exists
                         if self._log_timing and chunk_id != -1:
                             self._log_timing('mic_capture', chunk_id, timestamp=t_capture)
 
@@ -1713,9 +1732,17 @@ async def main():
                         client = LightberryLocalClient(url=LIVEKIT_URL, token=token, room_name=room_name,
                                                    loop=loop, trigger_event_queue=trigger_event_queue,
                                                    io_handler=persistent_io_handler)
-                        await client.start()
+                        await client.start() # Connects, signals handler, starts client tasks
                         logger.info("Client started successfully.")
                         current_state = AppState.ACTIVE
+                        # --- Clear trigger queue after successful transition --- #
+                        logger.debug("Clearing trigger queue after activating client...")
+                        while not trigger_event_queue.empty():
+                            try: trigger_event_queue.get_nowait(); trigger_event_queue.task_done()
+                            except asyncio.QueueEmpty: break
+                            except Exception: pass # Ignore other potential errors during clear
+                        logger.debug("Trigger queue cleared.")
+                        # ----------------------------------------------------- #
                         print("Connected and Active!", flush=True)
                     else:
                         logger.error("Failed to obtain credentials.")
