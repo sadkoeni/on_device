@@ -16,6 +16,11 @@ from datetime import datetime # Added import
 import sys # Import sys for stderr redirection
 from abc import ABC, abstractmethod # Added for Abstract Base Class
 import enum # Added for Enums
+# --- Add necessary imports ---
+import queue # Standard library queue for thread interaction
+from openwakeword.model import Model
+import resampy # Import for resampling (will be used later)
+# --- End Add necessary imports ---
 
 from livekit import rtc
 from livekit import api
@@ -265,6 +270,114 @@ class TrinkeyTrigger(TriggerController):
             logger.info("TrinkeyTrigger: Listener thread finished.")
 # --- End Trinkey Trigger ---
 
+# --- WakeWord Trigger Implementation ---
+class WakeWordTrigger(TriggerController):
+    def __init__(self,
+                 loop: asyncio.AbstractEventLoop,
+                 event_queue: asyncio.Queue,
+                 io_handler: 'LocalIOHandler', # Reference to the IO Handler
+                 activation_word: str = "hey_mycroft", # Default activation word
+                 stop_word: str = "hey_jarvis",        # Default stop word (maps to double press)
+                 threshold: float = 0.5):
+        super().__init__(loop, event_queue)
+        self.io_handler = io_handler
+        self.logger = logger.getChild("WakeWordTrigger")
+        self.audio_chunk_queue: Optional[queue.Queue] = None # Use standard queue for thread
+        try:
+            # Get the dedicated queue from the IO Handler
+            # Note: IOHandler needs get_wakeword_audio_queue() defined first
+            if hasattr(self.io_handler, 'get_wakeword_audio_queue'):
+                 self.audio_chunk_queue = self.io_handler.get_wakeword_audio_queue()
+                 self.logger.debug("Successfully retrieved wake word audio queue from IO Handler.")
+            else:
+                 # This will happen initially until IOHandler is refactored
+                 self.logger.warning("IO Handler does not have 'get_wakeword_audio_queue' method yet. Queue set to None.")
+
+        except Exception as e:
+            self.logger.error(f"Failed to get wake word audio queue from IO Handler: {e}. Trigger will not function.", exc_info=True)
+            # Listener loop will handle None queue gracefully.
+
+        self.activation_word = activation_word
+        self.stop_word = stop_word
+        self.threshold = threshold
+        self.oww_model: Optional[Model] = None
+
+        try:
+            self.logger.info("Initializing openWakeWord model...")
+            # Using ONNX by default, assuming it's generally available/performant
+            self.oww_model = Model(inference_framework='onnx')
+            model_keys = list(self.oww_model.models.keys())
+            self.logger.info(f"Loaded openWakeWord models: {model_keys}")
+
+            # Validate and log provided words against loaded models
+            if self.activation_word in self.oww_model.models:
+                self.logger.info(f"Using '{self.activation_word}' model for ACTIVATION trigger.")
+            else:
+                self.logger.warning(f"Configured activation word '{self.activation_word}' NOT FOUND in loaded models: {model_keys}")
+
+            if self.stop_word in self.oww_model.models:
+                self.logger.info(f"Using '{self.stop_word}' model for STOP trigger (double press event).")
+            else:
+                 self.logger.warning(f"Configured stop word '{self.stop_word}' NOT FOUND in loaded models: {model_keys}")
+
+        except ImportError:
+             self.logger.error("openwakeword library not found. Install it: pip install openwakeword")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize openWakeWord model: {e}", exc_info=True)
+
+    def _listener_loop(self):
+        """Listens for audio chunks and runs wake word detection."""
+        if not self.oww_model or self.audio_chunk_queue is None:
+            self.logger.error("WakeWordTrigger cannot start listener: Model or audio queue not available.")
+            return
+
+        self.logger.info("WakeWordTrigger listener thread starting...")
+        print(f"Listening for wake words: ACTIVATION='{self.activation_word}', STOP='{self.stop_word}'...")
+
+        while not self._stop_listening_flag.is_set():
+            try:
+                # Get chunk tuple: (chunk_data: bytes, chunk_id: int, t_capture: float)
+                chunk_tuple = self.audio_chunk_queue.get(timeout=0.5)
+                chunk_data, chunk_id, t_capture = chunk_tuple
+
+                # --- Perform Prediction --- #
+                try:
+                    # Convert raw bytes (assuming int16 @ 48kHz) to numpy array
+                    audio_int16_48k = np.frombuffer(chunk_data, dtype=np.int16)
+
+                    # --- Using 48kHz directly initially --- #
+                    audio_to_predict = audio_int16_48k
+                    # -------------------------------------- #
+
+                    # Predict using the audio chunk
+                    if audio_to_predict.size > 0:
+                        self.oww_model.predict(audio_to_predict)
+                        scores = self.oww_model.prediction_buffer
+                        activation_score = scores.get(self.activation_word, [0.0])[-1]
+                        stop_score = scores.get(self.stop_word, [0.0])[-1]
+
+                        # --- Emit Events --- #
+                        if activation_score > self.threshold:
+                            self.logger.info(f"Activation word '{self.activation_word}' detected (Score: {activation_score:.2f}). Emitting FIRST_PRESS.")
+                            self._emit_event(TriggerEvent.FIRST_PRESS)
+                            # time.sleep(0.2) # Refractory period - ADD LATER IF NEEDED
+                        elif stop_score > self.threshold:
+                            self.logger.info(f"Stop word '{self.stop_word}' detected (Score: {stop_score:.2f}). Emitting DOUBLE_PRESS.")
+                            self._emit_event(TriggerEvent.DOUBLE_PRESS)
+                            # time.sleep(0.2) # Refractory period - ADD LATER IF NEEDED
+
+                except Exception as pred_err:
+                     log_chunk_id = chunk_id if 'chunk_id' in locals() else 'unknown'
+                     self.logger.error(f"Error during wake word prediction for chunk {log_chunk_id}: {pred_err}", exc_info=True)
+
+            except queue.Empty: continue
+            except Exception as loop_err:
+                self.logger.error(f"Error in WakeWord listener loop: {loop_err}", exc_info=True)
+                time.sleep(0.1)
+
+        self.logger.info("WakeWordTrigger listener thread finished.")
+# --- End WakeWord Trigger ---
+
 # --- Mac Keyboard Trigger Implementation ---
 # Conditional import and implementation
 if platform.system() == "Darwin":
@@ -368,291 +481,321 @@ if platform.system() != "Darwin" or not _pynput_available:
 # --- End Placeholder ---
 
 
-class AudioIOHandler(IOHandlerInterface): # Implements IOHandlerInterface for Audio
-    """Manages interaction with audio input/output components and state, including input pausing."""
+# --- LocalIOHandler Definition (Replaces old AudioIOHandler) ---
+class LocalIOHandler:
+    """Manages interaction with owned audio input/output components and state.
+    Handles audio distribution to WakeWord and LiveKit paths, and playback.
+    Designed to be persistent and managed by the main application loop.
+    """
+    # Define constants for silence detection (can be moved later)
+    SILENCE_THRESHOLD = 50  # Amplitude threshold (adjust based on mic sensitivity)
+
     def __init__(self,
-                 audio_input: AudioInputInterface,
-                 audio_output: AudioOutputInterface,
-                 input_processor: InputProcessorInterface, # Keep input_processor param
-                 logger_instance: Optional['Logger'] = None):
-        self.audio_input = audio_input
-        self.audio_output = audio_output
-        self.input_processor = input_processor
-        self.logger = logger_instance or logger
-        self._loop = asyncio.get_running_loop()
-        self._user_audio_buffer_for_saving = asyncio.Queue(maxsize=500)
+                 loop: asyncio.AbstractEventLoop,
+                 logger_instance: Optional[logging.Logger] = None,
+                 trigger_event_queue: Optional[asyncio.Queue] = None):
+
+        # Basic initialization
+        self._loop = loop
+        self.logger = (logger_instance or logger).getChild("LocalIOHandler")
+        self._trigger_event_queue = trigger_event_queue
+
+        # Instantiate owned audio components
+        mic_frames_per_buffer = 480 # Align with 10ms LiveKit frames at 48kHz
+        self.audio_input = PyAudioMicrophoneInput(
+            loop=self._loop,
+            sample_rate=LIVEKIT_SAMPLE_RATE,
+            frames_per_buffer=mic_frames_per_buffer,
+            logger_instance=self.logger.getChild("MicInput"),
+            input_device_index=None # Use default input device
+        )
+        self.audio_output = SoundDeviceSpeakerOutput(
+            loop=self._loop,
+            sample_rate=LIVEKIT_SAMPLE_RATE,
+            channels=1,
+            logger_instance=self.logger.getChild("SpeakerOutput"),
+            output_device_index=None # Use default output device
+        )
+
+        # Create internal queues
+        self._wakeword_audio_queue = queue.Queue(maxsize=50) # Standard queue for WakeWord thread
+        self._livekit_input_queue = asyncio.Queue(maxsize=200) # Async queue for Client coroutine
+        self._speaker_output_queue = asyncio.Queue(maxsize=200) # Async queue for output transfer coroutine
+
+        # Create internal events
+        self._pause_input_event = asyncio.Event() # Gate for LiveKit input path
+        self._pause_wakeword_event = asyncio.Event() # Gate for WakeWord input path
+        self._stop_event = asyncio.Event() # Global stop for internal loops
+
+        # Initialize event states
+        self._pause_input_event.clear() # LiveKit path starts paused
+        self._pause_wakeword_event.set() # Wake word path starts active
+
+        # Initialize tasks
+        self._input_dist_task: Optional[asyncio.Task] = None
+        self._output_transfer_task: Optional[asyncio.Task] = None
+
+        # Initialize internal state tracking
+        self._assistant_speaking: bool = False
         self._playback_finished_event: Optional[asyncio.Event] = None
-
-        # New members for input pausing
-        self._internal_input_queue = asyncio.Queue(maxsize=200) # Intermediate queue
-        self._pause_input_event = asyncio.Event() # Event to control pausing
-        self._pause_input_event.set() # Start unpaused
-        self._transfer_input_task: Optional[asyncio.Task] = None # Task for the transfer loop
-
-        self.logger.debug("AudioIOHandler initialized with input pausing.")
-        if hasattr(self.audio_output, 'get_playback_finished_event'):
-            event = self.audio_output.get_playback_finished_event()
-            if isinstance(event, asyncio.Event):
-                self._playback_finished_event = event
-                self.logger.info("IOHandler obtained playback finished event.")
+        try:
+            # Attempt to get the event from the owned output component
+            if hasattr(self.audio_output, 'get_playback_finished_event'):
+                 event = self.audio_output.get_playback_finished_event()
+                 if isinstance(event, asyncio.Event):
+                     self._playback_finished_event = event
+                     self.logger.debug("Successfully obtained playback finished event.")
+                 else:
+                     self.logger.warning("Playback finished event from audio_output is not an asyncio.Event.")
             else:
-                self.logger.warning("playback_finished_event from audio_output is not an asyncio.Event")
-        else:
-            self.logger.warning("Audio output component does not have 'get_playback_finished_event' method.")
+                self.logger.warning("Audio output component lacks get_playback_finished_event method.")
+        except Exception as e:
+            self.logger.error(f"Failed to get playback finished event: {e}", exc_info=True)
 
-    def get_input_queue(self) -> asyncio.Queue:
-        """Returns the internal, pausable audio chunk queue for the input processor."""
-        # Return the new internal queue instead of the direct one
-        if not self._internal_input_queue:
-            self.logger.error("IOHandler: Internal input queue not initialized!")
-            # Raise an error or return a dummy to prevent downstream None errors
-            raise RuntimeError("IOHandler internal state error: input queue missing")
-        return self._internal_input_queue
+        self.logger.info("Persistent LocalIOHandler initialized.")
 
-    async def send_output_chunk(self, chunk: bytes):
-        """Sends an audio chunk to the output component."""
-        await self.audio_output.send_audio_chunk(chunk)
+    # --- Public Interface for Client and Trigger ---
+    def get_wakeword_audio_queue(self) -> queue.Queue:
+        """Returns the thread-safe queue for the WakeWordTrigger."""
+        return self._wakeword_audio_queue
 
-    async def signal_start_of_speech(self):
-        """Signals the start of assistant speech, pauses input transfer, and clears the save buffer."""
-        await self.audio_output.signal_start_of_speech()
-        # Pause the input transfer loop
-        self._pause_input_event.clear()
-        self.logger.debug("IOHandler: Input transfer paused.")
-        # Clear the save buffer when assistant starts speaking
-        self.logger.debug("IOHandler: Assistant started speaking, clearing save buffer.")
-        await self._empty_queue(self._user_audio_buffer_for_saving)
+    def get_livekit_input_queue(self) -> asyncio.Queue:
+        """Returns the async queue for the LightberryLocalClient mic forwarder."""
+        return self._livekit_input_queue
 
-    async def signal_end_of_speech(self):
-        """Signals the end of assistant speech, waits for playback, cleans input buffers, and resumes input transfer."""
-        # Signal end to the component (which handles its internal queue joining)
-        await self.audio_output.signal_end_of_speech()
-        # Wait for the component to signal completion via the event
-        await self._wait_for_output_completion()
-        # Clean input buffers after playback is fully finished
-        self.logger.debug("IOHandler: Playback finished, clearing input buffers.")
-        await self._clear_input_buffers()
-        # Resume the input transfer loop *after* buffers are cleared
-        # NOTE: Resuming is now handled by LightberryLocalClient.resume() based on trigger state
-        # self._pause_input_event.set()
-        # self.logger.debug("IOHandler: Input transfer resumed.")
-        self.logger.debug("IOHandler: Input transfer remains paused until explicitly resumed.")
-
-
-    async def _wait_for_output_completion(self):
-        """(Private) Waits for the playback finished event from the output component."""
-        if self._playback_finished_event:
-            try:
-                self.logger.debug("IOHandler waiting for playback finished event...")
-                # Wait until the event is set by the audio output component
-                await asyncio.wait_for(self._playback_finished_event.wait(), timeout=60.0) # Add timeout
-                self.logger.debug("IOHandler: Playback finished event received.")
-            except asyncio.TimeoutError:
-                self.logger.warning("IOHandler: Timeout waiting for playback finished event.")
-            except Exception as e:
-                self.logger.error(f"IOHandler: Error waiting for playback finished event: {e}")
-        else:
-            self.logger.warning("IOHandler: Playback finished event not available, cannot wait.")
-            await asyncio.sleep(0.5) # Fallback delay
-
-    def is_output_active(self) -> bool:
-        """Checks if the audio output component is currently speaking."""
-        return self.audio_output.is_speaking
-
-    def should_process_input(self) -> bool:
-        """Checks if the main processing loop should proceed (e.g., output not active)."""
-        # Currently just checks if output is active, can be expanded
-        return not self.is_output_active()
-
-    async def buffer_chunk_for_saving(self, chunk: bytes):
-        """Adds a user audio chunk to the save buffer."""
+    async def play_audio_chunk(self, chunk: bytes):
+        """Receives an audio chunk (e.g., from LiveKit client or trigger) for playback."""
+        if self._stop_event.is_set():
+            self.logger.debug("Handler stopping, discarding audio chunk for playback.")
+            return
         try:
-            await asyncio.wait_for(self._user_audio_buffer_for_saving.put(chunk), timeout=0.05)
+            await asyncio.wait_for(self._speaker_output_queue.put(chunk), timeout=0.2)
         except asyncio.TimeoutError:
-            self.logger.warning("IOHandler: Timeout putting chunk into save buffer queue.")
+             self.logger.warning("Timeout putting chunk into speaker output queue.")
         except asyncio.QueueFull:
-            self.logger.warning("IOHandler: User audio save buffer full, dropping chunk.")
+             self.logger.warning("Speaker output queue full, dropping chunk.")
         except Exception as e:
-            self.logger.error(f"IOHandler: Error buffering chunk for saving: {e}")
+            self.logger.error(f"Error putting chunk into speaker output queue: {e}")
 
-    async def save_buffered_audio(self, transcript_for_filename: str):
-        """Saves the currently buffered user audio chunks to a timestamped file."""
-        if self._user_audio_buffer_for_saving.empty():
-            self.logger.debug("IOHandler: No user audio chunks buffered for saving.")
-            return
+    async def signal_client_connected(self):
+        """Called by the client when it has successfully connected and is ready for audio."""
+        self.logger.info("Client connected signal received. Enabling LiveKit input path.")
+        await self._empty_queue(self._livekit_input_queue) # Clear any stale chunks
+        self._pause_input_event.set() # Allow audio flow to client
 
-        chunks_to_save = []
-        while not self._user_audio_buffer_for_saving.empty():
-            try:
-                chunk = self._user_audio_buffer_for_saving.get_nowait()
-                chunks_to_save.append(chunk)
-                self._user_audio_buffer_for_saving.task_done()
-            except asyncio.QueueEmpty:
-                break
-            except Exception as e:
-                self.logger.error(f"IOHandler: Error getting chunk from save buffer: {e}")
-                return # Avoid partial save
+    async def signal_client_disconnected(self):
+        """Called by the client when it is disconnecting."""
+        self.logger.info("Client disconnected signal received. Disabling LiveKit input path.")
+        self._pause_input_event.clear() # Stop audio flow to client path
+        await self._empty_queue(self._livekit_input_queue)
 
-        if not chunks_to_save:
-            self.logger.warning("IOHandler: Attempted to save user audio, but chunk list was empty after retrieval.")
-            return
-
-        try:
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            safe_transcript = "".join(c for c in transcript_for_filename if c.isalnum() or c in " _-").strip()[:50]
-            filename = f"recordings/{timestamp}_{safe_transcript}.raw"
-
-            self.logger.info(f"IOHandler: Saving {len(chunks_to_save)} user audio chunks to {filename}")
-            os.makedirs("recordings", exist_ok=True)
-            audio_data = b"".join(chunks_to_save)
-            with open(filename, "wb") as f:
-                f.write(audio_data)
-            self.logger.debug(f"IOHandler: Successfully saved user audio to {filename}")
-
-        except Exception as e:
-            self.logger.error(f"IOHandler: Failed to save user audio chunks: {e}", exc_info=True)
-
-    async def discard_buffered_audio(self):
-        """Discards the current content of the user audio save buffer."""
-        if not self._user_audio_buffer_for_saving.empty():
-            self.logger.debug("IOHandler: Discarding buffered audio...")
-            await self._empty_queue(self._user_audio_buffer_for_saving)
-            self.logger.debug("IOHandler: Buffered audio discarded.")
-
-    async def _clear_input_buffers(self):
-        """(Private) Clears source input queue, internal queue, save buffer."""
-        self.logger.debug("IOHandler: Clearing input buffers...")
-        # 1. Clear save buffer
-        await self._empty_queue(self._user_audio_buffer_for_saving)
-        self.logger.debug("IOHandler: Save buffer cleared.")
-
-        # 2. Clear internal input queue
-        await self._empty_queue(self._internal_input_queue)
-        self.logger.debug("IOHandler: Internal input queue cleared.")
-
-        # 3. Clear source queue in audio input component
-        try:
-            input_queue = self.audio_input.get_audio_chunk_queue()
-            await self._empty_queue(input_queue)
-            self.logger.debug("IOHandler: Source audio input queue cleared.")
-        except AttributeError:
-            self.logger.warning("IOHandler: Cannot clear source input queue - audio_input lacks get_audio_chunk_queue.")
-        except Exception as e:
-            self.logger.error(f"IOHandler: Error clearing source input component queue: {e}")
-
-        self.logger.debug("IOHandler: Input buffers cleared.")
-
-
-    async def _empty_queue(self, q: asyncio.Queue):
-        """Helper to quickly empty an asyncio queue."""
-        # Note: This is duplicated from StreamingClient, consider a utils file?
-        while not q.empty():
-            try:
-                item = q.get_nowait()
-                q.task_done()
-                # Log discarded item type/size for debugging if needed
-                # self.logger.debug(f"Discarding item from queue {q}: {type(item)}")
-            except asyncio.QueueEmpty:
-                break
-            except Exception as e:
-                self.logger.error(f"IOHandler: Error emptying queue {q}: {e}")
-                break # Avoid potential infinite loop
-
-    # Add start/stop methods to conform to interface (might be no-ops)
-    async def start(self):
-        self.logger.debug("AudioIOHandler start called. Starting underlying components and transfer task...")
-        # Ensure input starts paused until explicitly resumed by client logic
+    async def request_livekit_pause(self):
+        """Called by the client to request pausing the audio flow TO LiveKit."""
+        self.logger.info("Request received to pause LiveKit input path.")
         self._pause_input_event.clear()
-        await self.audio_input.start()
-        await self.audio_output.start()
-        # Start the input transfer task
-        if self._transfer_input_task is None or self._transfer_input_task.done():
-            self._transfer_input_task = asyncio.create_task(self._transfer_input_loop(), name="IOHandlerTransferInput")
-            self.logger.info("AudioIOHandler: Started input transfer task.")
-        else:
-            self.logger.warning("AudioIOHandler: Input transfer task already running?")
 
+    async def request_livekit_resume(self):
+        """Called by the client to request resuming the audio flow TO LiveKit."""
+        self.logger.info("Request received to resume LiveKit input path.")
+        await self._empty_queue(self._livekit_input_queue) # Clear potential stale input
+        # Only resume if assistant is not speaking
+        if not self._assistant_speaking:
+             self._pause_input_event.set()
+        else:
+             self.logger.debug("Ignoring resume request as assistant is speaking.")
+
+    # --- Lifecycle Management (Called by main) ---
+    async def start(self):
+        """Starts the IO Handler's components and internal processing loops."""
+        # Prevent multiple starts
+        if self._input_dist_task is not None and not self._input_dist_task.done():
+            self.logger.warning("LocalIOHandler start called but input task seems already running.")
+            return
+        if self._output_transfer_task is not None and not self._output_transfer_task.done():
+            self.logger.warning("LocalIOHandler start called but output task seems already running.")
+            return
+        self.logger.info("Starting LocalIOHandler...")
+        self._stop_event.clear()
+        self._pause_input_event.clear() # Client not connected yet
+        self._pause_wakeword_event.set() # Wake word should be active
+        self._assistant_speaking = False
+        try:
+            await self.audio_input.start()
+            await self.audio_output.start()
+            self._input_dist_task = asyncio.create_task(self._input_distribution_loop(), name="InputDistLoop")
+            self._output_transfer_task = asyncio.create_task(self._transfer_output_loop(), name="OutputTransferLoop")
+            self.logger.info("LocalIOHandler started successfully.")
+        except Exception as e:
+             self.logger.error(f"Error during LocalIOHandler start: {e}", exc_info=True)
+             await self.stop()
+             raise
 
     async def stop(self):
-        self.logger.debug("AudioIOHandler stop called. Stopping transfer task and underlying components...")
-        # Stop underlying components first
-        tasks = []
-        if self.audio_input and hasattr(self.audio_input, 'stop'):
-            tasks.append(asyncio.create_task(self.audio_input.stop(), name="AudioInputStop"))
-        if self.audio_output and hasattr(self.audio_output, 'stop'):
-            tasks.append(asyncio.create_task(self.audio_output.stop(), name="AudioOutputStop"))
-        if tasks:
-             stop_results = await asyncio.gather(*tasks, return_exceptions=True)
-             self.logger.debug(f"AudioIOHandler: Underlying components stop results: {stop_results}")
+        """Stops the IO Handler's components and internal processing loops."""
+        if self._stop_event.is_set():
+            self.logger.debug("LocalIOHandler stop called but already stopping or stopped.")
+            return
+        self.logger.info("Stopping LocalIOHandler...")
+        self._stop_event.set()
+        tasks_to_cancel = []
+        if self._input_dist_task and not self._input_dist_task.done(): tasks_to_cancel.append(self._input_dist_task)
+        if self._output_transfer_task and not self._output_transfer_task.done():
+             try: self._speaker_output_queue.put_nowait(None)
+             except (asyncio.QueueFull, Exception): pass
+             tasks_to_cancel.append(self._output_transfer_task)
+        if tasks_to_cancel:
+            self.logger.debug(f"Cancelling {len(tasks_to_cancel)} internal IO tasks...")
+            for task in tasks_to_cancel: task.cancel()
+            try: await asyncio.wait_for(asyncio.gather(*tasks_to_cancel, return_exceptions=True), timeout=5.0)
+            except asyncio.TimeoutError: self.logger.warning("Timeout cancelling internal IO tasks.")
+            except Exception as e: self.logger.error(f"Error cancelling internal IO tasks: {e}")
+        self._input_dist_task = None
+        self._output_transfer_task = None
+        component_stop_tasks = []
+        if hasattr(self, 'audio_input') and self.audio_input and hasattr(self.audio_input, 'stop'): component_stop_tasks.append(asyncio.create_task(self.audio_input.stop(), name="MicStop"))
+        if hasattr(self, 'audio_output') and self.audio_output and hasattr(self.audio_output, 'stop'): component_stop_tasks.append(asyncio.create_task(self.audio_output.stop(), name="SpeakerStop"))
+        if component_stop_tasks:
+             self.logger.debug(f"Stopping {len(component_stop_tasks)} underlying audio components...")
+             try: await asyncio.wait_for(asyncio.gather(*component_stop_tasks, return_exceptions=True), timeout=5.0)
+             except asyncio.TimeoutError: self.logger.warning("Timeout stopping underlying audio components.")
+             except Exception as e: self.logger.error(f"Error stopping underlying audio components: {e}")
+        self.logger.info("LocalIOHandler stopped.")
 
-        # Ensure the pause event is set so the transfer task doesn't block indefinitely during shutdown
-        self._pause_input_event.set()
-
-        # Stop the internal transfer task
-        transfer_task = self._transfer_input_task
-        self._transfer_input_task = None
-        if transfer_task and not transfer_task.done():
-            self.logger.debug("AudioIOHandler: Cancelling input transfer task...")
-            transfer_task.cancel()
-            try:
-                await asyncio.wait_for(transfer_task, timeout=2.0)
-                self.logger.debug("AudioIOHandler: Input transfer task cancelled successfully.")
-            except asyncio.TimeoutError:
-                self.logger.warning("AudioIOHandler: Timeout waiting for input transfer task to cancel.")
-            except asyncio.CancelledError:
-                self.logger.debug("AudioIOHandler: Input transfer task already cancelled.")
-            except Exception as e:
-                self.logger.error(f"AudioIOHandler: Error stopping input transfer task: {e}")
-
-        self.logger.info("AudioIOHandler stopped.")
-
-    async def _transfer_input_loop(self):
-        """(Private) Loop transferring audio from source input queue to internal queue, respecting pause event."""
-        self.logger.info("AudioIOHandler: Input transfer loop started.")
+    # --- Internal Processing Loops ---
+    async def _input_distribution_loop(self):
+        """Distributes audio from the single mic input to WakeWord and LiveKit queues."""
+        self.logger.info("Input distribution loop started.")
         source_queue = None
         try:
-            source_queue = self.audio_input.get_audio_chunk_queue()
+            if hasattr(self.audio_input, 'get_audio_chunk_queue'):
+                source_queue = self.audio_input.get_audio_chunk_queue()
+            else:
+                self.logger.error("InputDistLoop: audio_input missing get_audio_chunk_queue.") ; return
         except Exception as e:
-             self.logger.error(f"IOHandler Transfer Loop: Failed to get source input queue: {e}. Exiting.")
-             return # Cannot proceed without source queue
+             self.logger.error(f"InputDistLoop: Failed to get source queue: {e}. Exiting.", exc_info=True) ; return
+        if source_queue is None: self.logger.error("InputDistLoop: Source queue is None. Exiting.") ; return
 
-        while True:
+        while not self._stop_event.is_set():
             try:
-                # Wait until input is NOT paused
-                await self._pause_input_event.wait()
-
-                # Get chunk from the actual source queue
-                # Use timeout to periodically check for cancellation
                 chunk_tuple = await asyncio.wait_for(source_queue.get(), timeout=0.5)
-
-                # Put chunk tuple into the internal queue
-                try:
-                    # Use a short timeout for the internal queue put
-                    await asyncio.wait_for(self._internal_input_queue.put(chunk_tuple), timeout=0.1)
-                except asyncio.QueueFull:
-                    self.logger.warning("IOHandler Transfer Loop: Internal input queue full, discarding chunk.")
-                    # Need to mark task_done on internal queue if we add tracking there
-                except asyncio.TimeoutError:
-                    self.logger.warning("IOHandler Transfer Loop: Timeout putting chunk into internal queue.")
-                finally:
-                     source_queue.task_done() # Mark as done on the source queue regardless
-
-            except asyncio.TimeoutError:
-                # Normal timeout while waiting for source queue, check if stopping
-                # Cancellation is handled by the CancelledError below
-                continue
-            except asyncio.CancelledError:
-                self.logger.info("IOHandler Transfer Loop: Cancelled.")
-                break
+                source_queue.task_done()
+                if self._pause_wakeword_event.is_set():
+                    try: self._wakeword_audio_queue.put_nowait(chunk_tuple)
+                    except queue.Full: self.logger.debug("WakeWord audio queue full, discarding chunk.")
+                    except Exception as e: self.logger.error(f"Error putting chunk to WakeWord queue: {e}")
+                if self._pause_input_event.is_set():
+                    try: self._livekit_input_queue.put_nowait(chunk_tuple)
+                    except asyncio.QueueFull: self.logger.warning("LiveKit input queue full, discarding chunk.")
+                    except Exception as e: self.logger.error(f"Error putting chunk to LiveKit input queue: {e}")
+            except asyncio.TimeoutError: continue
+            except asyncio.CancelledError: self.logger.info("Input distribution loop cancelled."); break
             except Exception as e:
-                self.logger.error(f"IOHandler Transfer Loop: Error: {e}", exc_info=True)
-                # Avoid tight loop on unexpected error
+                self.logger.error(f"Error in input distribution loop: {e}", exc_info=True)
                 await asyncio.sleep(0.1)
+        self.logger.info("Input distribution loop finished.")
 
-        self.logger.info("AudioIOHandler: Input transfer loop finished.")
+    async def _transfer_output_loop(self):
+        """Reads from speaker queue, performs VAD, controls input pauses, sends to speaker."""
+        self.logger.info("Output transfer loop started.")
+        was_implicitly_paused = False
+        while not self._stop_event.is_set():
+            try:
+                chunk = await asyncio.wait_for(self._speaker_output_queue.get(), timeout=0.2)
+                self._speaker_output_queue.task_done()
+                if chunk is None: continue
+                energy = 0.0 ; is_currently_speech = False
+                try:
+                    if chunk:
+                        audio_int16 = np.frombuffer(chunk, dtype=np.int16)
+                        if audio_int16.size > 0: energy = np.mean(np.abs(audio_int16)) + 1e-9; is_currently_speech = energy > self.SILENCE_THRESHOLD
+                except Exception as e: self.logger.error(f"OutputTransferLoop: Error calculating energy: {e}")
+
+                if is_currently_speech and not self._assistant_speaking:
+                    self.logger.debug(f"Output VAD: Start of speech detected (Energy: {energy:.2f}).")
+                    self._assistant_speaking = True
+                    await self.audio_output.signal_start_of_speech()
+                    was_livekit_active_before_vad = self._pause_input_event.is_set()
+                    self._pause_input_event.clear()
+                    self._pause_wakeword_event.clear()
+                    was_implicitly_paused = was_livekit_active_before_vad
+                    self.logger.info("Assistant started speaking, pausing LiveKit & WakeWord input paths.")
+                elif not is_currently_speech and self._assistant_speaking:
+                    self.logger.debug("Output VAD: End of speech detected (silence). Waiting for playback.")
+                    self._assistant_speaking = False
+                    await self.audio_output.signal_end_of_speech()
+                    await self._wait_for_output_completion()
+                    self._pause_wakeword_event.set()
+                    if was_implicitly_paused:
+                        self._pause_input_event.set()
+                        self.logger.info("Assistant finished speaking, resuming WakeWord and LiveKit input paths.")
+                        await self._empty_queue(self._livekit_input_queue)
+                    else:
+                         self.logger.info("Assistant finished speaking, resuming WakeWord path. (LiveKit path remains paused).")
+                    was_implicitly_paused = False
+                if self._assistant_speaking:
+                    if hasattr(self, 'audio_output') and self.audio_output and hasattr(self.audio_output, 'send_audio_chunk'):
+                        await self.audio_output.send_audio_chunk(chunk)
+                    else: self.logger.warning("Cannot send chunk to speaker, audio_output invalid.")
+            except asyncio.TimeoutError:
+                 if self._assistant_speaking:
+                     self.logger.info("Output VAD: End of speech detected (timeout). Waiting for playback.")
+                     self._assistant_speaking = False
+                     await self.audio_output.signal_end_of_speech()
+                     await self._wait_for_output_completion()
+                     self._pause_wakeword_event.set()
+                     if was_implicitly_paused:
+                          self._pause_input_event.set()
+                          self.logger.info("Assistant finished speaking (timeout), resuming WakeWord and LiveKit paths.")
+                          await self._empty_queue(self._livekit_input_queue)
+                     else:
+                          self.logger.info("Assistant finished speaking (timeout), resuming WakeWord path. (LiveKit path remains paused).")
+                     was_implicitly_paused = False
+                 continue
+            except asyncio.CancelledError: self.logger.info("Output transfer loop cancelled."); break
+            except Exception as e:
+                self.logger.error(f"Error in output transfer loop: {e}", exc_info=True)
+                self._assistant_speaking = False; was_implicitly_paused = False
+                if self._pause_wakeword_event: self._pause_wakeword_event.set()
+                await asyncio.sleep(0.1)
+        self.logger.info("Output transfer loop finished.")
+
+    # --- Helper Methods ---
+    async def _wait_for_output_completion(self):
+        """Waits for the playback finished event from the owned audio output component."""
+        if self._playback_finished_event:
+            try:
+                self.logger.debug("Waiting for playback finished event...")
+                await asyncio.wait_for(self._playback_finished_event.wait(), timeout=60.0)
+                self.logger.debug("Playback finished event received.")
+                self._playback_finished_event.clear()
+            except asyncio.TimeoutError: self.logger.warning("Timeout waiting for playback finished event.")
+            except Exception as e: self.logger.error(f"Error waiting for playback finished event: {e}", exc_info=True)
+        else:
+            self.logger.warning("Playback finished event not available, cannot wait.")
+            await asyncio.sleep(0.5)
+
+    async def _empty_queue(self, q: Union[asyncio.Queue, queue.Queue]):
+        """Helper to quickly empty an asyncio or standard queue."""
+        emptied_count = 0
+        try:
+            if isinstance(q, asyncio.Queue):
+                while not q.empty():
+                    try: item = q.get_nowait(); q.task_done(); emptied_count += 1
+                    except asyncio.QueueEmpty: break
+            elif isinstance(q, queue.Queue):
+                 while True:
+                     try:
+                         item = q.get_nowait()
+                         try: q.task_done()
+                         except ValueError: pass
+                         emptied_count += 1
+                     except queue.Empty: break
+            else: self.logger.warning(f"_empty_queue called with unknown queue type: {type(q)}")
+        except Exception as e: self.logger.error(f"Error emptying queue {q}: {e}", exc_info=True)
+        if emptied_count > 0: self.logger.debug(f"Emptied {emptied_count} items from queue.")
 
 
-# --- PyAudio Class (Unchanged) ---
+# --- PyAudio Class (Keep Unchanged) ---
 class PyAudioMicrophoneInput(AudioInputInterface):
     """AudioInputInterface that reads microphone audio using PyAudio and puts chunks onto a queue."""
     def __init__(self,
@@ -1128,844 +1271,249 @@ class SoundDeviceSpeakerOutput(AudioOutputInterface): # Renamed class
          return self._playback_finished_event
 
 
-# --- LocalIOHandler Modifications ---
-class LocalIOHandler(AudioIOHandler):
-    # Define constants for silence detection
-    SILENCE_THRESHOLD = 50  # Amplitude threshold (adjust based on mic sensitivity)
-    SILENCE_TIMEOUT_S = 10.0 # Seconds of silence before pausing input
-
-    def __init__(self,
-                 audio_input: AudioInputInterface,
-                 audio_output: AudioOutputInterface,
-                 client_instance: 'LightberryLocalClient', # Added client instance
-                 logger_instance: Optional[logging.Logger] = None,
-                 trigger_event_queue: Optional[asyncio.Queue] = None): # Add trigger queue
-        # Pass None for input_processor as it's not used here
-        super().__init__(audio_input, audio_output, None, logger_instance)
-        self._client = client_instance # Store client instance
-        self._trigger_event_queue = trigger_event_queue # Store trigger queue
-        # Pass client callbacks to the audio input instance if it supports them
-        if hasattr(self.audio_input, '_log_timing') and hasattr(self.audio_input, '_get_chunk_id'):
-            self.logger.info("Passing timing/chunk ID callbacks to PyAudioMicrophoneInput.")
-            # Ensure the attributes exist on the client before assigning
-            if hasattr(self._client, '_log_timing') and hasattr(self._client, '_get_next_chunk_id'):
-                self.audio_input._log_timing = self._client._log_timing
-                self.audio_input._get_chunk_id = self._client._get_next_chunk_id
-            else:
-                 self.logger.error("Client instance is missing required timing/chunk ID methods.")
-        else:
-            self.logger.warning("Audio input interface does not support timing/chunk ID callbacks.")
-
-        self.internal_output_queue = asyncio.Queue(maxsize=200) # Queue for LiveKit -> Speaker transfer
-        self._transfer_output_task: Optional[asyncio.Task] = None # Task for the transfer loop
-
-        # --- New members for integrated silence monitoring ---
-        self.is_monitoring_silence: bool = False
-        self.silence_start_time: Optional[float] = None
-        # --- End new members ---
-
-    # --- Override _transfer_input_loop to add timing AND silence monitoring ---
-    async def _transfer_input_loop(self):
-        """(Overridden) Continuously transfers audio chunks from input source to internal queue, adding timing data and handling silence monitoring."""
-        source_queue = None
-        try:
-            source_queue = self.audio_input.get_audio_chunk_queue()
-        except AttributeError:
-             self.logger.error("IOHandler: Audio input object missing 'get_audio_chunk_queue'. Input transfer cannot start.")
-             return
-        except Exception as e:
-            self.logger.error(f"IOHandler: Error getting source audio queue: {e}. Input transfer cannot start.")
-            return
-
-        if source_queue is None:
-            self.logger.error("IOHandler: Could not get source audio queue. Input transfer cannot start.")
-            return
-
-        self.logger.info("IOHandler: Starting input transfer loop with timing.")
-        while True:
-            try:
-                # Wait if input is paused (controlled externally OR by silence monitor)
-                await self._pause_input_event.wait()
-
-                # Expecting (chunk_data, chunk_id, t_capture) from PyAudioMicrophoneInput
-                chunk_data, chunk_id, t_capture = await asyncio.wait_for(source_queue.get(), timeout=0.5)
-                t_get_mic_q = time.time()
-                source_queue.task_done()
-
-                # --- Integrated Silence Monitoring Logic ---
-                should_forward_chunk = True # Default to forwarding
-                if self.is_monitoring_silence:
-                    try:
-                        energy = np.mean(np.abs(np.frombuffer(chunk_data, dtype=np.int16))) + 1e-9
-                    except Exception as e:
-                        self.logger.error(f"Transfer Loop: Error calculating energy for chunk {chunk_id}: {e}")
-                        energy = self.SILENCE_THRESHOLD # Treat as silence on error
-
-                    if energy > self.SILENCE_THRESHOLD:
-                        # Speech detected, reset silence timer
-                        if self.silence_start_time is not None:
-                            self.logger.debug("Transfer Loop: Speech detected, resetting silence timer.")
-                        self.silence_start_time = None
-                    else:
-                        # Silence detected
-                        if self.silence_start_time is None:
-                            self.logger.debug("Transfer Loop: Silence detected, starting timer.")
-                            self.silence_start_time = time.time()
-                        else:
-                            # Timer running, check duration
-                            elapsed_silence = time.time() - self.silence_start_time
-                            if elapsed_silence > self.SILENCE_TIMEOUT_S:
-                                self.logger.info(f"Transfer Loop: {self.SILENCE_TIMEOUT_S}s silence detected. Pausing input transfer and signaling AUTO_PAUSE.")
-                                print("Auto-pausing input due to silence...", flush=True)
-                                self.is_monitoring_silence = False # Turn off monitoring
-                                self.silence_start_time = None
-                                self._pause_input_event.clear() # PAUSE this loop
-                                # --- Emit AUTO_PAUSE event --- 
-                                if self._trigger_event_queue:
-                                     try:
-                                          self._trigger_event_queue.put_nowait(TriggerEvent.AUTO_PAUSE)
-                                     except asyncio.QueueFull:
-                                          self.logger.warning("IOHandler: Trigger queue full, cannot emit AUTO_PAUSE.")
-                                # ---------------------------
-                                should_forward_chunk = False # Don't forward this silent chunk
-                                continue # Restart loop (will block on wait() until resumed)
-                # --- End Integrated Silence Monitoring Logic ---
-
-                # Forward the chunk if not paused by silence timeout
-                if should_forward_chunk:
-                    # Put (chunk_data, chunk_id, put_time) into internal queue
-                    t_put_internal_q = time.time()
-                    item_for_internal_q = (chunk_data, chunk_id, t_put_internal_q)
-
-                    # Log timing if available
-                    if hasattr(self._client, '_log_timing'):
-                        mic_q_wait = t_get_mic_q - t_capture
-                        self._client._log_timing('get_mic_q', chunk_id, timestamp=t_get_mic_q, wait_time=mic_q_wait)
-                        self._client._log_timing('put_internal_q', chunk_id, timestamp=t_put_internal_q)
-
-                    # Add to internal queue (used by LightberryLocalClient._forward_mic_to_livekit)
-                    try:
-                        await asyncio.wait_for(self._internal_input_queue.put(item_for_internal_q), timeout=0.1)
-                    except asyncio.TimeoutError:
-                        self.logger.warning(f"IOHandler: Timeout putting chunk {chunk_id} into internal queue. Queue possibly full.")
-                        if hasattr(self._client, '_log_timing'): self._client._log_timing('timeout_put_internal_q', chunk_id, timestamp=time.time())
-                        # continue # Let loop continue normally
-                    except asyncio.QueueFull: # Should be caught by TimeoutError with asyncio.Queue
-                        self.logger.warning(f"IOHandler: Internal queue full, dropping chunk {chunk_id}.")
-                        if hasattr(self._client, '_log_timing'): self._client._log_timing('discard_internal_q_full', chunk_id, timestamp=time.time())
-                        # continue # Let loop continue normally
-
-            except asyncio.TimeoutError:
-                # Timeout getting chunk from source queue - check silence timer if monitoring
-                if self.is_monitoring_silence and self.silence_start_time is not None:
-                    elapsed_silence = time.time() - self.silence_start_time
-                    if elapsed_silence > self.SILENCE_TIMEOUT_S:
-                        self.logger.info(f"Transfer Loop: {self.SILENCE_TIMEOUT_S}s silence detected (source queue empty). Pausing input transfer and signaling AUTO_PAUSE.")
-                        print("Auto-pausing input due to silence...", flush=True)
-                        self.is_monitoring_silence = False # Turn off monitoring
-                        self.silence_start_time = None
-                        self._pause_input_event.clear() # PAUSE this loop
-                        # --- Emit AUTO_PAUSE event --- 
-                        if self._trigger_event_queue:
-                             try:
-                                  self._trigger_event_queue.put_nowait(TriggerEvent.AUTO_PAUSE)
-                             except asyncio.QueueFull:
-                                  self.logger.warning("IOHandler: Trigger queue full, cannot emit AUTO_PAUSE.")
-                        # ---------------------------
-                        # No chunk to forward, just continue loop (will block on wait())
-                continue # Continue loop on normal timeout or if silence timer hasn't expired
-
-            except asyncio.CancelledError:
-                self.logger.info("IOHandler Input Transfer Loop: Cancelled.")
-                break
-            except Exception as e:
-                self.logger.error(f"IOHandler Input Transfer Loop: Error processing audio chunk: {e}", exc_info=True)
-                await asyncio.sleep(0.1) # Avoid tight loop
-        self.logger.info("IOHandler: Input transfer loop finished.")
-
-    # --- Override _clear_input_buffers --- (No changes needed here)
-    async def _clear_input_buffers(self):
-        """(Overridden) Clears source input queue, internal queue, save buffer."""
-        self.logger.debug("IOHandler: Clearing input buffers...")
-        # 1. Clear save buffer
-        await self._empty_queue(self._user_audio_buffer_for_saving)
-        self.logger.debug("IOHandler: Save buffer cleared.")
-
-        # 2. Clear internal input queue (contains tuples)
-        await self._empty_queue(self._internal_input_queue)
-        self.logger.debug("IOHandler: Internal input queue cleared.")
-
-        # 3. Clear source queue in audio input component (contains tuples)
-        try:
-            has_method = hasattr(self.audio_input, 'get_audio_chunk_queue')
-            if has_method:
-                 input_queue = self.audio_input.get_audio_chunk_queue()
-                 await self._empty_queue(input_queue)
-                 self.logger.debug("IOHandler: Source audio input queue cleared.")
-            else:
-                 self.logger.warning("IOHandler: Cannot clear source input queue - audio_input lacks get_audio_chunk_queue method.")
-        except AttributeError: # Should be caught by hasattr now
-             self.logger.warning("IOHandler: Cannot clear source input queue - audio_input lacks get_audio_chunk_queue.")
-        except Exception as e:
-             self.logger.error(f"IOHandler: Error clearing source input component queue: {e}")
-
-        self.logger.debug("IOHandler: Input buffers cleared.")
-
-    # --- Override signal_start/end_of_speech ---
-    async def signal_start_of_speech(self):
-        """(Overridden) Signals start of speech, stops silence monitor, pauses input transfer."""
-        # Stop silence monitoring when assistant starts speaking
-        self.is_monitoring_silence = False
-        self.silence_start_time = None
-        self.logger.debug("IOHandler: Assistant started speaking, silence monitoring stopped.")
-
-        await self.audio_output.signal_start_of_speech()
-        # Pause the input transfer loop (mic -> internal queue)
-        self._pause_input_event.clear()
-        self.logger.debug("IOHandler: Mic input transfer PAUSED due to assistant speech.")
-        # Clear the save buffer
-        self.logger.debug("IOHandler: Clearing save buffer.")
-        await self._empty_queue(self._user_audio_buffer_for_saving)
-
-    async def signal_end_of_speech(self):
-        """(Overridden) Signals end of speech, waits for playback, cleans buffers, saves timing, RESUMES input, starts silence monitoring."""
-        await self.audio_output.signal_end_of_speech()
-        await self._wait_for_output_completion()
-
-        self.logger.info("IOHandler: Playback finished, clearing input buffers.")
-        await self._clear_input_buffers()
-
-        # Save Timing Data
-        if hasattr(self._client, 'save_timing_data'):
-            self.logger.info("IOHandler: Saving collected timing data...")
-            self._client.save_timing_data()
-            self.logger.info("IOHandler: Timing data saved.")
-        else:
-            self.logger.warning("IOHandler: Client missing save_timing_data method.")
-
-        # Resume input and start silence monitoring
-        self.logger.info("IOHandler: Resuming input and enabling silence monitoring.")
-        self.is_monitoring_silence = True
-        self.silence_start_time = None # Reset timer start
-        self._pause_input_event.set() # RESUME input transfer loop
-
-    # --- send_output_chunk --- (No changes needed here)
-    async def send_output_chunk(self, chunk: bytes):
-        """(Overridden) Puts chunk into the internal output queue for the transfer loop."""
-        # This queue is now used for LiveKit -> Speaker transfer
-        try:
-            await asyncio.wait_for(self.internal_output_queue.put(chunk), timeout=0.1)
-        except asyncio.TimeoutError:
-             self.logger.warning("IOHandler: Timeout putting chunk into internal *output* queue.")
-        except asyncio.QueueFull:
-             self.logger.warning("IOHandler: Internal *output* queue full, dropping chunk.")
-        except Exception as e:
-            self.logger.error(f"IOHandler: Error sending chunk to internal output queue: {e}")
-
-    # --- _transfer_output_loop --- (No changes needed here, uses class SILENCE_THRESHOLD)
-    async def _transfer_output_loop(self):
-        """
-        (Overridden) Transfers audio from internal output queue (filled by LiveKit) to the actual speaker output component.
-        Handles start/end of speech detection based on chunk content.
-        """
-        receiving_output = False # Local state for this loop
-        silence_count = 0
-        silence_frames_needed = 50 # Frames of silence needed to trigger end of speech
-
-        self.logger.info("IOHandler: Starting output transfer loop (LiveKit -> Speaker).")
-        while True:
-            try:
-                # Wait for a chunk from the internal output queue
-                chunk = await asyncio.wait_for(self.internal_output_queue.get(), timeout=0.2)
-                self.internal_output_queue.task_done()
-
-                # Skip processing if chunk is None (e.g., sentinel during shutdown)
-                if chunk is None:
-                    continue
-
-                # Simple energy-based VAD
-                try:
-                    # Use a small epsilon to avoid issues with pure silence
-                    energy = np.mean(np.abs(np.frombuffer(chunk, dtype=np.int16))) + 1e-9
-                except Exception as e:
-                    self.logger.error(f"IOHandler: Error calculating energy for output chunk: {e}")
-                    energy = self.SILENCE_THRESHOLD # Treat as silence on error, use class constant
-
-                if not receiving_output and energy > self.SILENCE_THRESHOLD:
-                    receiving_output = True
-                    silence_count = 0
-                    self.logger.debug("IOHandler Output: Detected start of assistant speech.")
-                    await self.signal_start_of_speech()
-                elif receiving_output and energy < self.SILENCE_THRESHOLD:
-                    silence_count += 1
-                    if silence_count > silence_frames_needed:
-                        receiving_output = False
-                        silence_count = 0
-                        self.logger.debug("IOHandler Output: Detected end of assistant speech (silence).")
-                        await self.signal_end_of_speech()
-                elif receiving_output and energy >= self.SILENCE_THRESHOLD:
-                    silence_count = 0
-
-                if self.audio_output.is_speaking:
-                    await self.audio_output.send_audio_chunk(chunk)
-
-            except asyncio.TimeoutError:
-                if receiving_output:
-                    receiving_output = False
-                    silence_count = 0
-                    self.logger.info("IOHandler Output: Detected end of speech due to timeout.")
-                    if self.audio_output.is_speaking:
-                         await self.signal_end_of_speech()
-                continue
-            except asyncio.CancelledError:
-                self.logger.info("IOHandler Transfer Output Loop: Cancelled.")
-                break
-            except Exception as e:
-                self.logger.error(f"IOHandler Transfer Output Loop: Error: {e}", exc_info=True)
-                receiving_output = False
-                silence_count = 0
-                await asyncio.sleep(0.1)
-
-        self.logger.info("IOHandler: Output transfer loop finished.")
-
-    # --- start --- (No changes needed here)
-    async def start(self):
-        self.logger.debug("LocalIOHandler start: Starting components and transfer tasks...")
-        # Input starts paused
-        self._pause_input_event.clear()
-        # Start underlying components
-        await self.audio_input.start()
-        await self.audio_output.start()
-
-        # Start the input transfer task (Mic -> Internal Queue)
-        if self._transfer_input_task is None or self._transfer_input_task.done():
-            self._transfer_input_task = asyncio.create_task(self._transfer_input_loop(), name="IOHandlerTransferInput")
-            self.logger.info("LocalIOHandler: Started input transfer task.")
-        else:
-            self.logger.warning("LocalIOHandler: Input transfer task already running?")
-
-        # Start the output transfer task (Internal Queue -> Speaker)
-        if self._transfer_output_task is None or self._transfer_output_task.done():
-            self._transfer_output_task = asyncio.create_task(self._transfer_output_loop(), name="IOHandlerTransferOutput")
-            self.logger.info("LocalIOHandler: Started output transfer task.")
-        else:
-            self.logger.warning("LocalIOHandler: Output transfer task already running?")
-
-    # --- stop --- (No changes needed here, silence monitoring state handled implicitly)
-    async def stop(self):
-        self.logger.debug("LocalIOHandler stop: Stopping transfer tasks and components...")
-        io_stop_timeout = 5.0 # Shorter timeout for IO tasks
-
-        # --- Stop Transfer Tasks ---
-        tasks_to_stop = []
-        # Set pause event to allow input task to potentially finish gracefully if waiting
-        self._pause_input_event.set()
-        if self._transfer_input_task and not self._transfer_input_task.done():
-             tasks_to_stop.append(self._transfer_input_task)
-             self._transfer_input_task = None # Clear ref early
-        if self._transfer_output_task and not self._transfer_output_task.done():
-             # Enqueue None to potentially help output loop finish cleanly
-             try: self.internal_output_queue.put_nowait(None)
-             except asyncio.QueueFull: pass
-             tasks_to_stop.append(self._transfer_output_task)
-             self._transfer_output_task = None # Clear ref early
-
-        if tasks_to_stop:
-             self.logger.debug(f"Cancelling {len(tasks_to_stop)} IO transfer tasks (timeout: {io_stop_timeout}s)...")
-             for task in tasks_to_stop:
-                 task.cancel()
-             try:
-                 # Wait for tasks with timeout
-                 await asyncio.wait_for(asyncio.gather(*tasks_to_stop, return_exceptions=True), timeout=io_stop_timeout)
-                 self.logger.debug("IO transfer tasks cancelled or finished.")
-             except asyncio.TimeoutError:
-                  self.logger.warning(f"Timeout waiting for IO transfer tasks to cancel after {io_stop_timeout}s.")
-             except Exception as e:
-                  self.logger.error(f"Error cancelling IO transfer tasks: {e}", exc_info=True)
-        # --- End Stop Transfer Tasks ---
-
-        # --- Stop Underlying Components ---
-        component_stop_tasks = []
-        if self.audio_input and hasattr(self.audio_input, 'stop'):
-            component_stop_tasks.append(asyncio.create_task(self.audio_input.stop(), name="AudioInputStop"))
-        if self.audio_output and hasattr(self.audio_output, 'stop'):
-            component_stop_tasks.append(asyncio.create_task(self.audio_output.stop(), name="AudioOutputStop"))
-
-        if component_stop_tasks:
-             self.logger.debug(f"Stopping {len(component_stop_tasks)} underlying audio components (timeout: {io_stop_timeout}s)...")
-             try:
-                 # Wait for component stop tasks with timeout
-                 await asyncio.wait_for(asyncio.gather(*component_stop_tasks, return_exceptions=True), timeout=io_stop_timeout)
-                 self.logger.debug("Underlying components stopped or finished.")
-             except asyncio.TimeoutError:
-                 self.logger.warning(f"Timeout waiting for underlying audio components to stop after {io_stop_timeout}s.")
-             except Exception as e:
-                 self.logger.error(f"Error stopping underlying audio components: {e}", exc_info=True)
-        # --- End Stop Underlying Components ---
-
-        self.logger.info("LocalIOHandler stop sequence finished.")
-
-    # --- clear_output_buffer --- (No changes needed here)
-    async def clear_output_buffer(self):
-        """Clears the internal output queue (LiveKit -> Speaker)."""
-        self.logger.debug("LocalIOHandler: Clearing internal output buffer...")
-        await self._empty_queue(self.internal_output_queue)
-        self.logger.debug("LocalIOHandler: Internal output buffer cleared.")
-
-
 # --- LightberryLocalClient Modifications ---
 class LightberryLocalClient:
-    def __init__(self, url: str, token: str, room_name: str, loop: asyncio.AbstractEventLoop, trigger_event_queue: asyncio.Queue):
+    # Note: Client is now transient, created/destroyed per connection cycle.
+    # It interacts with the persistent LocalIOHandler.
+    def __init__(self, url: str, token: str, room_name: str,
+                 loop: asyncio.AbstractEventLoop,
+                 trigger_event_queue: asyncio.Queue,
+                 io_handler: LocalIOHandler): # Accepts the persistent handler
+
         self.livekit_url = url
         self.livekit_token = token
-        self.room_name = room_name # Though token usually defines the room
+        self.room_name = room_name
         self._loop = loop
-        self.logger = logger.getChild("Client") # Add logger instance
+        self.logger = logger.getChild("Client")
+        self.io_handler = io_handler # Store reference to persistent handler
+        self._trigger_event_queue = trigger_event_queue
+
         self._room: Optional[rtc.Room] = None
-        self._is_connected = False # Track connection status
-        self._is_paused = False # Track pause state
+        self._is_connected = False
+        self._is_paused = False
 
         # --- Timing Infrastructure ---
         self.timing_data = []
         self.chunk_id_counter = 0
-        # Initialize path immediately
         self.timing_log_file_path: Optional[str] = self._generate_timing_log_path()
-        self._timing_lock = threading.Lock() # Use threading lock for thread safety
         # --- End Timing Infrastructure ---
 
-        # --- Instantiate Audio components ---
-        # Use standard rate (48kHz) for LiveKit compatibility
-        # Align chunk size with 10ms LiveKit frames (480 samples = 960 bytes)
-        mic_frames_per_buffer = 480
-        self._mic_input: PyAudioMicrophoneInput = PyAudioMicrophoneInput(
-            loop=self._loop,
-            sample_rate=LIVEKIT_SAMPLE_RATE,
-            frames_per_buffer=mic_frames_per_buffer,
-            logger_instance=logger.getChild("MicInput"),
-            log_timing_cb=self._log_timing,
-            get_chunk_id_cb=self._get_next_chunk_id,
-            input_device_index=None # Use default input device
-            )
-        self._speaker_output: SoundDeviceSpeakerOutput = SoundDeviceSpeakerOutput(
-            loop=self._loop,
-            sample_rate=LIVEKIT_SAMPLE_RATE,
-            channels=1,
-            logger_instance=logger.getChild("SpeakerOutput"),
-            output_device_index=None # Use default output device
-            )
-        # --- End Audio Instantiation ---
-
-        # --- Instantiate IO Handler ---
-        # Pass self (client instance) AND trigger_event_queue to the handler
-        self._local_io_handler: LocalIOHandler = LocalIOHandler(
-             self._mic_input, self._speaker_output, self, logger.getChild("LocalIOHandler"), trigger_event_queue=trigger_event_queue
-        )
-        # --- End IO Handler ---
-
+        # LiveKit specific members
         self._mic_audio_source: Optional[rtc.AudioSource] = None
         self._mic_track_pub: Optional[rtc.LocalTrackPublication] = None
         self._forward_mic_task: Optional[asyncio.Task] = None
-        self._playback_tasks: dict[str, asyncio.Task] = {} # track_sid -> playback task
+        self._playback_tasks: dict[str, asyncio.Task] = {}
 
-        # Log the initialized path
-        self.logger.info(f"LightberryLocalClient initialized. Timing logs will be saved to '{self.timing_log_file_path}'")
+        self.logger.info(f"LightberryLocalClient initialized. Timing logs: '{self.timing_log_file_path}'")
 
     def _register_listeners(self):
-        if not self._room:
-            return
+        if not self._room: return
         self._room.on("track_subscribed", self._on_track_subscribed)
         self._room.on("disconnected", self._on_disconnected)
-        # Add more listeners if needed (e.g., participant connected/disconnected)
-        logger.info("Room event listeners registered.")
+        self.logger.debug("Room event listeners registered.")
 
     async def connect(self):
         """Connects to the LiveKit room."""
-        if self._is_connected:
-             logger.warning("Already connected to LiveKit.")
-             return
-        logger.info(f"Attempting to connect to LiveKit URL: {self.livekit_url} in room '{self.room_name}'...")
+        if self._is_connected: self.logger.warning("Already connected."); return
+        self.logger.info(f"Connecting to {self.livekit_url} in room '{self.room_name}'...")
         try:
             self._room = rtc.Room(loop=self._loop)
-            self._register_listeners() # Register listeners before connecting
-            # TODO: Add connection timeout?
+            self._register_listeners()
             await self._room.connect(self.livekit_url, self.livekit_token)
-            self._is_connected = True # Set flag on successful connection
-            logger.info(f"Successfully connected to LiveKit room: {self._room.name} (SID: {await self._room.sid})")
-
-        except rtc.ConnectError as e:
-            logger.error(f"Failed to connect to LiveKit room: {e}", exc_info=True)
-            self._room = None
-            self._is_connected = False
-            raise # Re-raise the exception so caller (main loop) knows connection failed
+            self._is_connected = True
+            self.logger.info(f"Connected to LiveKit room: {self._room.name}")
         except Exception as e:
-             logger.error(f"Unexpected error during LiveKit connection: {e}", exc_info=True)
-             self._room = None
-             self._is_connected = False
-             raise
-
+            self.logger.error(f"LiveKit connection failed: {e}", exc_info=True)
+            self._room = None ; self._is_connected = False ; raise
 
     async def start(self):
-        """Starts IO components, connects to LiveKit, and starts processing tasks."""
-        logger.info("Starting LightberryLocalClient...")
-        if self._is_connected:
-            logger.warning("Client already started and connected.")
-            return
+        """Connects to LiveKit, signals IO Handler, starts processing tasks."""
+        self.logger.info("Starting LightberryLocalClient...")
+        if self._is_connected: self.logger.warning("Client already started."); return
         try:
-            # 1. Start the IO Handler (starts mic/speaker components and IO transfer loops)
-            await self._local_io_handler.start()
-
-            # 2. Connect to the room
-            await self.connect() # Raises exception on failure
-
-            # 3. Create and publish mic track if connection successful
+            await self.connect()
             if self._is_connected:
-                await self._create_and_publish_mic_track() # Creates source and publishes
-
-                # 4. Start the microphone forwarding task if source exists
+                await self.io_handler.signal_client_connected()
+                await self._create_and_publish_mic_track()
                 if self._mic_audio_source:
-                    # Clear buffer and resume input immediately after connecting
-                    await self._local_io_handler._clear_input_buffers()
-                    self._local_io_handler._pause_input_event.set() # Unpause mic input
-                    self._is_paused = False # Ensure not paused on fresh start
-
+                    self._is_paused = False
                     self._forward_mic_task = asyncio.create_task(self._forward_mic_to_livekit(), name="ForwardMicToLiveKit")
-                    logger.info("Microphone forwarding task started.")
+                    self.logger.info("Microphone forwarding task started.")
                 else:
-                    logger.error("Could not start microphone forwarding: AudioSource not created.")
-                    # Consider stopping if mic forwarding is critical?
                     raise RuntimeError("Failed to create microphone audio source.")
-
-                logger.info("Client started and processing tasks initiated.")
+                self.logger.info("Client started and processing tasks initiated.")
             else:
-                 # This case should ideally be handled by connect() raising an error
-                 logger.error("Client start failed because room connection failed.")
-                 await self.stop() # Attempt cleanup
-
+                 self.logger.error("Client start failed: room connection failed.")
+                 # await self.stop() # Avoid potential recursion if stop fails
         except Exception as e:
-             logger.error(f"Error during client start sequence: {e}", exc_info=True)
-             await self.stop() # Ensure cleanup on error
-             raise # Propagate error to main loop
+             self.logger.error(f"Error during client start sequence: {e}", exc_info=True)
+             # await self.stop() # Avoid potential recursion
+             raise
 
-    async def _perform_stop_operations(self, initial_connected_state: bool):
-        """Helper coroutine containing the actual stop operations for timeout."""
-        # --- Cancel running tasks ---
-        tasks_to_cancel: list[Optional[asyncio.Task]] = []
-        tasks_to_cancel.append(self._forward_mic_task)
-        tasks_to_cancel.extend(self._playback_tasks.values())
-
+    async def _perform_stop_operations(self):
+        """Internal helper to perform stop actions in sequence."""
+        # Cancel tasks
+        tasks_to_cancel = [self._forward_mic_task] + list(self._playback_tasks.values())
         active_tasks = [task for task in tasks_to_cancel if task and not task.done()]
-
         if active_tasks:
-             self.logger.info(f"Cancelling {len(active_tasks)} background tasks...")
-             for task in active_tasks:
-                 task.cancel()
-             results = await asyncio.gather(*active_tasks, return_exceptions=True)
-             self.logger.debug(f"Background task cancellation results: {results}")
-
+             self.logger.debug(f"Cancelling {len(active_tasks)} client background tasks...")
+             for task in active_tasks: task.cancel()
+             try: await asyncio.gather(*active_tasks, return_exceptions=True)
+             except Exception as e: self.logger.error(f"Error gathering cancelled tasks: {e}", exc_info=True)
         self._forward_mic_task = None
         self._playback_tasks.clear()
-
-        # --- Stop IO handler (stops underlying components and its transfer loops) ---
-        if self._local_io_handler:
-             await self._local_io_handler.stop()
-
-        # --- Unpublish mic track ---
+        # Unpublish track
         if self._mic_track_pub and self._room and self._room.local_participant:
-            self.logger.info(f"Unpublishing microphone track {self._mic_track_pub.sid}...")
+            self.logger.debug(f"Unpublishing mic track {self._mic_track_pub.sid}...")
             try:
-                if self._room.local_participant:
-                    await self._room.local_participant.unpublish_track(self._mic_track_pub.sid)
-                    self.logger.info("Microphone track unpublished.")
-                else:
-                     self.logger.warning("Local participant not found during unpublish.")
-            except Exception as e:
-                 self.logger.error(f"Error unpublishing mic track: {e}", exc_info=True)
+                if self._room.local_participant: await self._room.local_participant.unpublish_track(self._mic_track_pub.sid)
+                self.logger.info("Microphone track unpublished.")
+            except Exception as e: self.logger.error(f"Error unpublishing mic track: {e}", exc_info=True)
         self._mic_track_pub = None
-        self._mic_audio_source = None # Clear source reference
-
-        # --- Disconnect from room ---
+        self._mic_audio_source = None
+        # Disconnect from room
         room_to_disconnect = self._room
-        self._room = None # Clear room reference
-        if room_to_disconnect and initial_connected_state:
+        self._room = None
+        if room_to_disconnect and self._is_connected: # Check flag again before disconnect
             self.logger.info("Disconnecting from LiveKit room...")
-            try:
-                await room_to_disconnect.disconnect()
-                self.logger.info("Disconnected from LiveKit room successfully.")
-            except Exception as e:
-                 self.logger.error(f"Error during room disconnect: {e}", exc_info=True)
-        elif initial_connected_state:
-            self.logger.warning("Room reference lost before disconnect could be called.")
-        else:
-             self.logger.debug("Already disconnected or room not initialized.")
+            try: await room_to_disconnect.disconnect()
+            except Exception as e: self.logger.error(f"Error during room disconnect: {e}", exc_info=True)
+        # Signal Handler AFTER disconnect
+        try: await self.io_handler.signal_client_disconnected()
+        except Exception as e: self.logger.error(f"Error signaling IO Handler of client disconnect: {e}")
+        # Save Timing Data
+        try: self.save_timing_data()
+        except Exception as e: self.logger.error(f"Error saving client timing data during stop: {e}", exc_info=True)
 
     async def stop(self):
-        """Stops all tasks, disconnects, and cleans up resources with a timeout."""
+        """Stops client tasks, disconnects, signals IO Handler."""
         if not self._is_connected and not self._forward_mic_task and not self._playback_tasks:
-             self.logger.debug("Stop called but client appears already stopped or not started.")
-             # Reset flags just in case
-             self._is_connected = False
-             self._is_paused = False
+             self.logger.debug("Client stop called but appears already stopped.")
              return
-
         self.logger.info("Stopping LightberryLocalClient...")
-        initial_connected_state = self._is_connected
-        self._is_connected = False # Mark as disconnected early
-        self._is_paused = False # Reset paused state on stop
-        stop_success = False
-        timeout_duration = 10.0
-
+        # --- Set flags early in case stop operations fail --- #
+        was_connected = self._is_connected # Remember initial state
+        self._is_connected = False
+        self._is_paused = False
+        # --------------------------------------------------- #
         try:
-            # Use asyncio.wait_for for older Python versions
-            await asyncio.wait_for(self._perform_stop_operations(initial_connected_state), timeout=timeout_duration)
-            stop_success = True # Mark as successful if timeout wasn't hit
-
-        except asyncio.TimeoutError: # wait_for raises asyncio.TimeoutError
-             self.logger.error(f"LightberryLocalClient stop operation timed out after {timeout_duration}s.")
-             # Force clear resources that might be hanging?
-             self._forward_mic_task = None
-             self._playback_tasks.clear()
-             self._mic_track_pub = None
-             self._mic_audio_source = None
-             self._room = None
-             # Re-raise the error to signal failure to the caller (main loop)
-             raise
+            await self._perform_stop_operations()
+            self.logger.info("LightberryLocalClient stop sequence completed.")
         except Exception as e:
-             self.logger.error(f"Unexpected error during client stop: {e}", exc_info=True)
-             # Optionally re-raise or just log?
-             # raise # Uncomment if main loop should handle this too
-        finally:
-             if stop_success:
-                 self.logger.info("LightberryLocalClient stopped successfully.")
-             else:
-                 self.logger.warning("LightberryLocalClient stop finished, but may not have completed gracefully (timeout or error).")
+             self.logger.error(f"Unexpected error during client stop operations: {e}", exc_info=True)
+             # Logged error, main loop finally block will handle handler shutdown
 
-    # --- New Pause/Resume Methods ---
+    # --- Pause/Resume Methods --- #
     async def pause(self):
-        """Pauses audio processing, cancelling silence monitor first."""
-        if not self._is_connected:
-            logger.warning("Cannot pause, client is not connected.")
-            return
-        if self._is_paused:
-            logger.debug("Client already paused.")
-            return
-
-        logger.info("Pausing client...")
+        if self._is_paused: self.logger.debug("Client already paused."); return
+        # Only allow pause if connected?
+        # if not self._is_connected: self.logger.warning("Cannot pause, not connected."); return
+        self.logger.info("Requesting IO Handler to pause LiveKit input.")
         self._is_paused = True
-        # Explicitly stop silence monitoring in IO Handler
-        if hasattr(self._local_io_handler, 'is_monitoring_silence'): # Check attribute exists
-            self._local_io_handler.is_monitoring_silence = False
-            self._local_io_handler.silence_start_time = None
-
-        # Pause input transfer loop
-        if self._local_io_handler._pause_input_event.is_set():
-            self.logger.debug("Pausing input transfer.")
-            self._local_io_handler._pause_input_event.clear()
-        else:
-            self.logger.debug("Input transfer already paused (pause called).")
-
-        # Playback pausing is handled implicitly
-        logger.info("Client Paused.")
+        try: await self.io_handler.request_livekit_pause()
+        except Exception as e: self.logger.error(f"Error requesting pause from IO Handler: {e}")
+        self.logger.info("Client set to Paused state.")
 
     async def resume(self):
-        """Resumes audio processing."""
-        if not self._is_connected:
-            logger.warning("Cannot resume, client is not connected.")
-            return
-
-        # Explicitly ensure silence monitoring is off when manually resuming
-        if hasattr(self._local_io_handler, 'is_monitoring_silence'): # Check attribute exists
-            self._local_io_handler.is_monitoring_silence = False
-            self._local_io_handler.silence_start_time = None
-
+        if not self._is_paused: self.logger.debug("Client is not paused."); return
+        # if not self._is_connected: self.logger.warning("Cannot resume, not connected."); return
+        self.logger.info("Requesting IO Handler to resume LiveKit input.")
         self._is_paused = False
-        # Clear any potentially stale audio received during pause
-        await self._local_io_handler.clear_output_buffer()
-        # Resume microphone input transfer
-        if not self._local_io_handler._pause_input_event.is_set():
-             self.logger.info("Resuming input transfer.")
-             self._local_io_handler._pause_input_event.set()
-        else:
-             self.logger.debug("Input transfer already resumed.")
-        logger.info("Client Resumed.")
-
+        try: await self.io_handler.request_livekit_resume()
+        except Exception as e: self.logger.error(f"Error requesting resume from IO Handler: {e}")
+        self.logger.info("Client set to Resumed state.")
 
     async def _create_and_publish_mic_track(self):
-        if not self._room or not self._room.local_participant:
-            logger.error("Cannot create mic track: Not connected to room or no local participant.")
-            return
-        if self._mic_audio_source:
-            logger.warning("Mic track already created.")
-            return
+        if not self._room or not self._room.local_participant: self.logger.error("Cannot create mic track: Not connected/no participant."); return
+        if self._mic_audio_source: self.logger.warning("Mic audio source already exists."); return
         try:
-            # Create source with LIVEKIT_SAMPLE_RATE (48kHz)
-            logger.info(f"Creating mic AudioSource with rate {LIVEKIT_SAMPLE_RATE}Hz")
+            self.logger.debug(f"Creating mic AudioSource (Rate: {LIVEKIT_SAMPLE_RATE}Hz)")
             self._mic_audio_source = rtc.AudioSource(LIVEKIT_SAMPLE_RATE, LIVEKIT_CHANNELS)
             track = rtc.LocalAudioTrack.create_audio_track("mic-audio", self._mic_audio_source)
             options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
-            logger.info("Publishing microphone audio track...")
+            self.logger.info("Publishing mic audio track...")
             self._mic_track_pub = await self._room.local_participant.publish_track(track, options)
-            logger.info(f"Microphone track published successfully (SID: {self._mic_track_pub.sid}).")
+            self.logger.info(f"Mic track published (SID: {self._mic_track_pub.sid}).")
         except Exception as e:
-            logger.error(f"Failed to create or publish mic track: {e}", exc_info=True)
-            self._mic_audio_source = None # Clean up source on error
-        # Ensure proper spacing/indentation before the next method
+            self.logger.error(f"Failed to create/publish mic track: {e}", exc_info=True)
+            self._mic_audio_source = None
 
     async def _forward_mic_to_livekit(self):
-        """Task to read timed audio chunks from IOHandler queue and push frames to LiveKit AudioSource."""
-        if not self._mic_audio_source:
-            logger.error("Cannot forward mic audio: AudioSource is not available.")
-            return
-
+        """Task reads from IOHandler's LiveKit queue, pushes frames to LiveKit."""
+        if not self._mic_audio_source: self.logger.error("Cannot forward mic: AudioSource missing."); return
         try:
-            # Get queue from IO Handler (contains (chunk_data, chunk_id, t_put_internal_q))
-            internal_queue = self._local_io_handler._internal_input_queue
-
-            # Calculate frame properties (should match input buffer now)
-            mic_frames_per_buffer = self._mic_input._frames_per_buffer # Get from instance
-            samples_per_frame = mic_frames_per_buffer
-            bytes_per_frame = samples_per_frame * LIVEKIT_CHANNELS * 2 # e.g., 480 * 1 * 2 = 960
-
-            logger.info(f"Starting microphone forwarding loop (Expecting {bytes_per_frame}-byte frames)")
-
-            while self._is_connected: # Loop while connected
+            livekit_input_queue = self.io_handler.get_livekit_input_queue()
+            expected_bytes_per_frame = 480 * LIVEKIT_CHANNELS * 2
+            self.logger.info(f"Starting mic forwarding loop (Expecting {expected_bytes_per_frame} bytes)...")
+            while self._is_connected:
                 try:
-                    # Get item with timeout to allow checking _is_connected
-                    chunk_data, chunk_id, t_put_internal_q = await asyncio.wait_for(internal_queue.get(), timeout=0.5)
-
-                    t_get_internal_q = time.time()
-                    internal_queue.task_done()
-
-                    # Log timing if available
-                    if hasattr(self, '_log_timing'):
-                         internal_q_wait = t_get_internal_q - t_put_internal_q
-                         self._log_timing('get_internal_q', chunk_id, timestamp=t_get_internal_q, wait_time=internal_q_wait)
-
-                    # --- Validate and Send Frame ---
-                    if len(chunk_data) != bytes_per_frame:
-                         logger.warning(f"Chunk {chunk_id} size mismatch! Expected {bytes_per_frame}, got {len(chunk_data)}. Skipping frame.")
-                         if hasattr(self, '_log_timing'): self._log_timing('skip_frame_size', chunk_id, timestamp=time.time())
+                    chunk_data, chunk_id, t_capture = await asyncio.wait_for(livekit_input_queue.get(), timeout=0.5)
+                    t_get_lk_q = time.time()
+                    livekit_input_queue.task_done()
+                    # --- Client-side Timing --- #
+                    # Note: t_capture is from the original mic read time
+                    lk_q_wait = t_get_lk_q - t_capture # Includes IO handler distribution latency
+                    self._log_timing('get_livekit_q', chunk_id, timestamp=t_get_lk_q, wait_time=lk_q_wait)
+                    # ------------------------- #
+                    if len(chunk_data) != expected_bytes_per_frame:
+                         self.logger.warning(f"Chunk {chunk_id} size mismatch! Expected {expected_bytes_per_frame}, got {len(chunk_data)}. Skipping.")
+                         self._log_timing('skip_frame_size', chunk_id, timestamp=time.time())
                          continue
-
-                    frame = rtc.AudioFrame(
-                        sample_rate=LIVEKIT_SAMPLE_RATE,
-                        num_channels=LIVEKIT_CHANNELS,
-                        samples_per_channel=samples_per_frame,
-                        data=chunk_data
-                    )
-
+                    samples_per_channel = expected_bytes_per_frame // (LIVEKIT_CHANNELS * 2)
+                    frame = rtc.AudioFrame(sample_rate=LIVEKIT_SAMPLE_RATE,
+                                           num_channels=LIVEKIT_CHANNELS,
+                                           samples_per_channel=samples_per_channel,
+                                           data=chunk_data)
                     t_start_send = time.time()
-                    # Ensure source still exists before capturing
                     if self._mic_audio_source:
                         await self._mic_audio_source.capture_frame(frame)
-                    else:
-                        logger.warning(f"Mic audio source became None while trying to send frame {chunk_id}. Stopping forwarder.")
-                        break # Exit loop if source disappears
-
+                    else: self.logger.warning(f"Mic source None sending frame {chunk_id}. Stopping."); break
                     t_end_send = time.time()
-                    if hasattr(self, '_log_timing'):
-                         send_duration = t_end_send - t_start_send
-                         self._log_timing('sent_livekit', chunk_id, timestamp=t_end_send, duration=send_duration)
-                    # --- End Send Frame ---
-
-                except asyncio.TimeoutError:
-                    # Just continue loop if timeout, connection check handles exit
-                    continue
-                except asyncio.CancelledError:
-                     logger.info("Microphone forwarding task cancelled.")
-                     break # Exit loop on cancellation
+                    self._log_timing('sent_livekit', chunk_id, timestamp=t_end_send, duration=t_end_send - t_start_send)
+                except asyncio.TimeoutError: continue
+                except asyncio.CancelledError: self.logger.info("Mic forwarding task cancelled."); break
                 except Exception as e:
-                    # Log chunk ID if available
                     log_chunk_id = chunk_id if 'chunk_id' in locals() else 'unknown'
-                    logger.error(f"Error in mic forward loop processing chunk {log_chunk_id}: {e}", exc_info=True)
-                    await asyncio.sleep(0.1) # Avoid tight loop on error
-
-        except asyncio.CancelledError:
-            logger.info("Microphone forwarding task cancelled (outer loop).")
-        except Exception as e:
-             logger.error(f"Fatal error in microphone forwarding task: {e}", exc_info=True)
-        finally:
-             logger.info("Microphone forwarding loop finished.")
-             # Ensure mic input is paused if loop exits unexpectedly
-             if self._local_io_handler: self._local_io_handler._pause_input_event.clear()
-
+                    self.logger.error(f"Error in mic forward loop chunk {log_chunk_id}: {e}", exc_info=True)
+                    await asyncio.sleep(0.1)
+        except asyncio.CancelledError: self.logger.info("Mic forwarding task cancelled (outer).")
+        except Exception as e: self.logger.error(f"Fatal error in mic forwarding task: {e}", exc_info=True)
+        finally: self.logger.info("Mic forwarding loop finished.")
 
     def _on_disconnected(self):
-        self.logger.warning("Disconnected from LiveKit room unexpectedly!")
-        # Signal the main loop via the trigger queue
-        if hasattr(self, '_local_io_handler') and self._local_io_handler._trigger_event_queue:
-            try:
-                # Use call_soon_threadsafe if this callback might not be on the main loop
-                # For now, assume it is or put_nowait is safe enough.
-                self._local_io_handler._trigger_event_queue.put_nowait(TriggerEvent.UNEXPECTED_DISCONNECT)
-                self.logger.info("Emitted UNEXPECTED_DISCONNECT event to trigger queue.")
-            except asyncio.QueueFull:
-                self.logger.error("Trigger queue full, cannot emit UNEXPECTED_DISCONNECT event!")
-            except Exception as e:
-                self.logger.error(f"Error emitting UNEXPECTED_DISCONNECT event: {e}")
-        else:
-             self.logger.error("Cannot emit UNEXPECTED_DISCONNECT: Trigger queue not found in IO handler.")
-        # REMOVED: self._stop_event.set()
-        # REMOVED: self._mic_source_ready.clear() # _mic_source_ready was removed earlier
+        """Callback when disconnected unexpectedly from LiveKit room."""
+        self.logger.warning("Disconnected unexpectedly from LiveKit!")
+        self._is_connected = False
+        if self._trigger_event_queue:
+            try: self._loop.call_soon_threadsafe(self._trigger_event_queue.put_nowait, TriggerEvent.UNEXPECTED_DISCONNECT)
+            except Exception as e: self.logger.error(f"Error emitting UNEXPECTED_DISCONNECT: {e}")
+        else: self.logger.error("Cannot emit UNEXPECTED_DISCONNECT: Trigger queue missing.")
 
     def _on_track_subscribed(self, track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant):
-        logger.info(f"Track subscribed: {track.kind} '{track.name}' from {participant.identity}")
+        self.logger.info(f"Track subscribed: {track.kind} '{track.name}' from {participant.identity}")
         if track.kind == rtc.TrackKind.KIND_AUDIO and participant.identity == ASSISTANT_IDENTITY:
-            if track.sid not in self._playback_tasks:
-                logger.info(f"Assistant audio track ({track.sid}) detected. Starting playback task.")
+            if track.sid not in self._playback_tasks or self._playback_tasks[track.sid].done():
+                self.logger.info(f"Assistant audio track ({track.sid}) detected. Starting playback task.")
                 task = asyncio.create_task(self._forward_livekit_to_speaker(track), name=f"Playback_{track.sid[:6]}")
                 self._playback_tasks[track.sid] = task
-        else:
-            logger.debug("Subscribed track is not the target assistant audio track.")
+            else: self.logger.warning(f"Assistant audio track ({track.sid}) already has active playback task.")
+        else: self.logger.debug(f"Ignoring subscribed track: Kind={track.kind}, Identity={participant.identity}")
 
     async def _forward_livekit_to_speaker(self, track: rtc.Track):
-        """Task to read 48kHz audio frames from a LiveKit track and forward to the speaker output."""
-        # Use standard rate in log
-        logger.info(f"Starting playback loop for track {track.sid} (Rate: {LIVEKIT_SAMPLE_RATE}Hz)") 
+        """Task reads from LiveKit track, sends chunks to IO Handler playback."""
+        self.logger.info(f"Starting playback loop for track {track.sid}")
         audio_stream = rtc.AudioStream(track)
-        # Remove local silence detection state - now handled in LocalIOHandler
-        # is_speaking = False # Track speaking state for this specific track
-        # silence_threshold = 100 # Adjust as needed for int16 amplitude
         try:
             async for frame_event in audio_stream:
                 frame = frame_event.frame
-                # Check against standard rate
                 if frame.sample_rate != LIVEKIT_SAMPLE_RATE or frame.num_channels != LIVEKIT_CHANNELS:
-                    logger.warning(f"Unexpected audio format received on track {track.sid}: SR={frame.sample_rate}, Ch={frame.num_channels}. Skipping frame.")
+                    self.logger.warning(f"Unexpected audio format on track {track.sid}. Skipping.")
                     continue
-
-                audio_bytes = bytes(frame.data)
-
-                # --- Remove Silence Detection Logic ---
-                # try:
-                #     # Assuming int16 PCM data
-                #     audio_samples = np.frombuffer(audio_bytes, dtype=np.int16)
-                #     # Use absolute mean as a simple measure of energy
-                #     # Use a small epsilon to avoid division by zero or log(0) if calculating RMS dB later
-                #     abs_mean = np.mean(np.abs(audio_samples)) + 1e-10
-
-                #     currently_speaking = abs_mean > silence_threshold
-
-                #     if currently_speaking and not is_speaking:
-                #         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-                #         logger.info(f"[{timestamp}] Assistant started speaking (Track: {track.sid}, Mean: {abs_mean:.2f})")
-                #         is_speaking = True
-                #     elif not currently_speaking and is_speaking:
-                #         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-                #         logger.info(f"[{timestamp}] Assistant stopped speaking (Track: {track.sid}, Mean: {abs_mean:.2f})")
-                #         is_speaking = False
-
-                # except Exception as e:
-                #     logger.error(f"Error during silence detection for track {track.sid}: {e}", exc_info=True)
-                # --- End Silence Detection Logic ---
-
-                # Send audio chunk to the IO Handler's output queue
-                await self._local_io_handler.send_output_chunk(audio_bytes) 
-        except asyncio.CancelledError:
-            logger.info(f"Playback task for track {track.sid} cancelled.")
-        except Exception as e:
-            logger.error(f"Error in playback loop for track {track.sid}: {e}", exc_info=True)
+                await self.io_handler.play_audio_chunk(bytes(frame.data))
+        except asyncio.CancelledError: self.logger.info(f"Playback task {track.sid} cancelled.")
+        except Exception as e: self.logger.error(f"Error in playback loop {track.sid}: {e}", exc_info=True)
         finally:
-            logger.info(f"Playback loop for track {track.sid} finished.")
+            self.logger.info(f"Playback loop {track.sid} finished.")
             self._playback_tasks.pop(track.sid, None)
 
     # --- Timing Methods ---
@@ -1974,60 +1522,28 @@ class LightberryLocalClient:
          return os.path.join(TIMING_LOG_DIR, f"timing_log_{timestamp}.json")
 
     def _get_next_chunk_id(self) -> int:
-         # No need for async lock if counter is only incremented here sequentially
-         # If called from multiple async tasks concurrently, locking would be needed
          self.chunk_id_counter += 1
          return self.chunk_id_counter
 
     def _log_timing(self, event_type: str, chunk_id: int, **kwargs):
-         # Using asyncio.Lock is incorrect here as this might be called from sync callbacks
-         # Rely on GIL for list append atomicity for simple cases, or use thread-safe queue if needed
-         # For now, direct append, assuming low contention from logging points
-         log_entry = {
-             'timestamp': time.time(),
-             'event': event_type,
-             'chunk_id': chunk_id,
-             **kwargs
-         }
+         log_entry = { 'timestamp': time.time(), 'event': event_type,
+                       'chunk_id': chunk_id, **kwargs }
          self.timing_data.append(log_entry)
-         # Limit log size in memory if necessary
-         # MAX_LOG_ENTRIES = 50000 # Example limit
-         # if len(self.timing_data) > MAX_LOG_ENTRIES:
-         #     self.timing_data.pop(0) # Remove oldest entry
 
     def save_timing_data(self):
-        # No async lock needed if called only from signal_end_of_speech in IOHandler's task
-        # Safeguard against None path
-        if self.timing_log_file_path is None:
-            self.logger.warning("save_timing_data called with None path, generating new path...")
-            self.timing_log_file_path = self._generate_timing_log_path()
-            if self.timing_log_file_path is None: # Check again if generation failed
-                 self.logger.error("Failed to generate timing log path! Cannot save timing data.")
-                 # Reset data even if save fails?
-                 self.timing_data = []
-                 self.chunk_id_counter = 0
-                 return
-
-        self.logger.info(f"Saving {len(self.timing_data)} timing entries to {self.timing_log_file_path}...")
+        if not self.timing_data: self.logger.debug("No timing data to save."); return
+        if self.timing_log_file_path is None: self.timing_log_file_path = self._generate_timing_log_path()
+        if self.timing_log_file_path is None: self.logger.error("Cannot save timing: path generation failed."); return
+        self.logger.info(f"Saving {len(self.timing_data)} client timing entries to {self.timing_log_file_path}...")
         try:
-            # Ensure the directory exists before writing
             os.makedirs(TIMING_LOG_DIR, exist_ok=True)
-            with open(self.timing_log_file_path, 'w') as f:
-                json.dump(self.timing_data, f, indent=2)
-            self.logger.info("Timing data successfully saved.")
-        except TypeError as te:
-            # Add specific logging for the TypeError case
-            self.logger.error(f"TypeError saving timing data: {te}. Path was: {self.timing_log_file_path} (Type: {type(self.timing_log_file_path)}). Data length: {len(self.timing_data)}", exc_info=True)
-        except Exception as e:
-            self.logger.error(f"Failed to save timing data: {e}", exc_info=True)
-
-        # Reset for the next interaction
-        self.timing_data = []
-        self.chunk_id_counter = 0
-        # Generate path for the *next* save attempt
+            with open(self.timing_log_file_path, 'w') as f: json.dump(self.timing_data, f, indent=2)
+            self.logger.info("Client timing data saved.")
+        except Exception as e: self.logger.error(f"Failed to save timing data: {e}", exc_info=True)
+        self.timing_data = [] ; self.chunk_id_counter = 0
         self.timing_log_file_path = self._generate_timing_log_path()
-        self.logger.info(f"Timing log reset. Next log will be: {self.timing_log_file_path}")
     # --- End Timing Methods ---
+
 
 async def main():
     # --- Basic Setup ---
@@ -2045,282 +1561,246 @@ async def main():
     # --- State Machine & Control Variables ---
     loop = asyncio.get_running_loop()
     trigger_event_queue = asyncio.Queue()
-    stop_event = asyncio.Event() # Global stop signal
+    stop_event = asyncio.Event() # Global stop signal for main loop only
     current_state = AppState.IDLE
     client: Optional[LightberryLocalClient] = None
-    trigger_controller: Optional[TriggerController] = None
+
+    # --- Persistent Components --- #
+    persistent_io_handler: Optional[LocalIOHandler] = None
+    active_trigger_controller: Optional[TriggerController] = None
+    ww_trigger: Optional[WakeWordTrigger] = None
+    trinkey_trigger: Optional[TrinkeyTrigger] = None
+    keyboard_trigger: Optional[MacKeyboardTrigger] = None
+    # --- End Persistent Components --- #
+
     token: Optional[str] = None
     room_name: Optional[str] = None
     device_id: Optional[str] = None
     username: Optional[str] = None
 
-    # --- Instantiate Trigger Controller ---
+    # --- Instantiate Persistent IO Handler --- #
     try:
+        persistent_io_handler = LocalIOHandler(
+            loop=loop,
+            logger_instance=logger, # Pass main logger
+            trigger_event_queue=trigger_event_queue # Pass the shared queue
+        )
+    except Exception as e:
+         logger.error(f"FATAL: Failed to initialize LocalIOHandler: {e}", exc_info=True)
+         return # Cannot continue without IO handler
+
+    # --- Instantiate Trigger Controllers --- #
+    try:
+        # Always create WakeWordTrigger if IO Handler succeeded
+        ww_trigger = WakeWordTrigger(
+            loop=loop,
+            event_queue=trigger_event_queue,
+            io_handler=persistent_io_handler # Pass the handler instance
+        )
+        logger.info("WakeWordTrigger initialized.")
+
+        # Try platform-specific triggers
         if platform.system() == "Darwin":
-            logger.info("Platform is Darwin, attempting to use MacKeyboardTrigger.")
-            # Check if pynput is available (check done internally by MacKeyboardTrigger class)
-            trigger_controller = MacKeyboardTrigger(loop, trigger_event_queue)
-            # Add a check here to see if MacKeyboardTrigger considers itself functional
-            if not hasattr(trigger_controller, '_listener_loop'): # Simple check if placeholder was used
-                 logger.warning("MacKeyboardTrigger is unavailable (pynput likely missing). Trying Trinkey.")
-                 trigger_controller = None # Fallback to trinkey
-            elif not _pynput_available: # Check the global flag set during import
-                 logger.warning("MacKeyboardTrigger loaded but pynput failed import earlier. Trying Trinkey.")
-                 trigger_controller = None # Fallback to trinkey
+            logger.info("Platform is Darwin, attempting MacKeyboardTrigger.")
+            keyboard_trigger = MacKeyboardTrigger(loop, trigger_event_queue)
+            if not hasattr(keyboard_trigger, '_listener_loop') or not _pynput_available:
+                 logger.warning("MacKeyboardTrigger unavailable or pynput failed. Trying Trinkey.")
+                 keyboard_trigger = None # Indicate failure
+                 # Attempt Trinkey as fallback only if Mac failed
+                 trinkey_trigger = TrinkeyTrigger(loop, trigger_event_queue, ADAFRUIT_VID, TRINKEY_PID, TRINKEY_KEYCODE)
+                 logger.info("TrinkeyTrigger initialized as fallback.")
             else:
-                 logger.info("MacKeyboardTrigger initialized.")
-        # Fallback or default to Trinkey if not Darwin or Mac trigger failed
-        if trigger_controller is None:
-             logger.info("Attempting to use TrinkeyTrigger.")
-             # Note: find_trinkey_path logs warnings/errors if not found
-             # TrinkeyTrigger init doesn't fail if path not found initially, listener loop handles it
-             trigger_controller = TrinkeyTrigger(loop, trigger_event_queue, ADAFRUIT_VID, TRINKEY_PID, TRINKEY_KEYCODE)
+                 logger.info("MacKeyboardTrigger initialized successfully.")
+        else:
+             # Default to Trinkey on non-Darwin platforms
+             logger.info("Platform is not Darwin, attempting TrinkeyTrigger.")
+             trinkey_trigger = TrinkeyTrigger(loop, trigger_event_queue, ADAFRUIT_VID, TRINKEY_PID, TRINKEY_KEYCODE)
              logger.info("TrinkeyTrigger initialized.")
 
-    except Exception as e:
-         logger.error(f"Failed to initialize a trigger controller: {e}", exc_info=True)
-         # Allow continuing without a trigger for debugging/testing? Or exit?
-         # For now, log error and proceed; loop will handle None controller.
-         trigger_controller = None
+        # --- Select Active Trigger --- #
+        # TODO: Make this selection configurable (e.g., command line arg)
+        # For now, let's prioritize WakeWord if available, then keyboard, then trinkey
+        # This needs refinement based on desired default behavior
+        if ww_trigger:
+            active_trigger_controller = ww_trigger
+        elif keyboard_trigger and _pynput_available:
+             active_trigger_controller = keyboard_trigger
+        elif trinkey_trigger:
+             active_trigger_controller = trinkey_trigger
+        else:
+             active_trigger_controller = None # No trigger available
 
-    if trigger_controller is None:
-        logger.error("FATAL: No functional trigger controller could be initialized. Exiting.")
-        return
+        if active_trigger_controller:
+             logger.info(f"Selected {active_trigger_controller.__class__.__name__} as the active trigger controller (for logging/debug).")
+        else:
+             logger.error("Could not initialize any functional trigger controller!")
+             if persistent_io_handler: await persistent_io_handler.stop()
+             return
+
+    except Exception as e:
+         logger.error(f"FATAL: Error during trigger controller initialization: {e}", exc_info=True)
+         if persistent_io_handler: await persistent_io_handler.stop()
+         return
 
     # --- Main State Machine Loop ---
     try:
-        # Define callback for IO Handler to request state change
-        async def request_main_state_change(new_state: AppState):
-            nonlocal current_state # Allow modification of main loop's state variable
-            logger.info(f"IO Handler requested state change to {new_state.name}")
-            # Add safety check? e.g., only allow transition to PAUSED from ACTIVE?
-            if current_state == AppState.ACTIVE and new_state == AppState.PAUSED:
-                 current_state = new_state
-            else:
-                 logger.warning(f"Ignoring state change request from {current_state.name} to {new_state.name}")
-
-        # --- Instantiate IO Handler --- (Move after callback definition)
-        # This was implicitly done inside LightberryLocalClient before
-        # Now we might need to instantiate it here if we pass the callback?
-        # Let's check LightberryLocalClient init... yes, it creates it.
-        # We need to modify LightberryLocalClient to accept the callback
-        # OR pass the queue to IOHandler and emit an event (Simpler change)
-
-        # --- Let's use the event queue approach (Simpler Refactor) ---
-        # We'll add a new TriggerEvent.AUTO_PAUSE
-        # LocalIOHandler will emit this event when silence timeout occurs.
-        # The ACTIVE state handler will listen for this event.
-        # No callback needed.
-
         while not stop_event.is_set():
             logger.debug(f"--- Main Loop: Current State = {current_state.name} ---")
+
             if current_state == AppState.IDLE:
                 print("\n>>> Current State: IDLE <<<", flush=True)
                 logger.info("Entered IDLE state.")
-                # Ensure trigger listener is running
+                if client is not None:
+                     logger.warning("Client instance found in IDLE state, attempting stop...")
+                     try: await client.stop()
+                     except Exception as e: logger.error(f"Error stopping stale client: {e}")
+                     client = None
                 try:
-                    logger.info("Starting trigger listener...")
-                    trigger_controller.start_listening() # Safe to call multiple times
+                    logger.info("Ensuring persistent IO handler is started...")
+                    await persistent_io_handler.start()
+                    # --- Start ALL available trigger listeners --- #
+                    logger.info("Starting all available trigger listeners...")
+                    if ww_trigger:
+                         logger.debug("Starting WakeWordTrigger listener...")
+                         ww_trigger.start_listening()
+                    if keyboard_trigger:
+                         logger.debug("Starting MacKeyboardTrigger listener...")
+                         keyboard_trigger.start_listening()
+                    if trinkey_trigger:
+                         logger.debug("Starting TrinkeyTrigger listener...")
+                         trinkey_trigger.start_listening()
+                    # --- End Start ALL listeners --- #
                 except Exception as e:
-                    logger.error(f"Error starting trigger listener: {e}. Stopping.")
-                    current_state = AppState.STOPPING
-                    continue
+                    logger.error(f"Error starting persistent components/listeners: {e}. Stopping application.", exc_info=True)
+                    stop_event.set() ; continue
 
-                print("Waiting for the first trigger press (Spacebar or Trinkey)...", flush=True)
-                logger.info("Clearing potential stale events from trigger queue...")
-                """while not trigger_event_queue.empty():
-                    try:
-                        stale_event = trigger_event_queue.get_nowait()
-                        logger.warning(f"Discarding stale event from queue before wait: {stale_event.name}")
-                        trigger_event_queue.task_done()
-                    except asyncio.QueueEmpty:
-                        break
-                    except Exception as e:
-                         logger.error(f"Error clearing stale event: {e}")
-
+                print(f"Waiting for any trigger...", flush=True)
+                # Clear potential stale events
+                while not trigger_event_queue.empty():
+                    try: stale_event = trigger_event_queue.get_nowait(); trigger_event_queue.task_done()
+                    except asyncio.QueueEmpty: break
+                    except Exception: pass
+                    logger.debug(f"Discarded stale event: {stale_event.name}")
                 try:
-                    logger.info("<<< Waiting for trigger_event_queue.get() >>>")
-                    # Wait indefinitely for the first trigger event
+                    logger.debug("<<< Waiting for trigger event >>>")
                     event = await trigger_event_queue.get()
-                    logger.info(f"<<< Event RECEIVED from queue: {event.name} >>>")
+                    logger.info(f"Event received from trigger queue: {event.name}")
                     trigger_event_queue.task_done()
-
-                    # We expect FIRST_PRESS to initiate connection
                     if event == TriggerEvent.FIRST_PRESS:
-                        logger.info("First trigger event received. Transitioning to CONNECTING.")
+                        logger.info("Activation trigger received. Transitioning to CONNECTING.")
                         print("Trigger received! Connecting...", flush=True)
                         current_state = AppState.CONNECTING
-                        # Keep listener active
+                    elif event == TriggerEvent.UNEXPECTED_DISCONNECT:
+                         logger.warning("Received UNEXPECTED_DISCONNECT in IDLE state. Ignoring.")
                     else:
                         logger.warning(f"Unexpected event '{event.name}' received in IDLE state. Ignoring.")
-                
-                except asyncio.CancelledError:
-                    logger.info("IDLE state wait cancelled.")
-                    current_state = AppState.STOPPING
+                except asyncio.CancelledError: logger.info("IDLE state wait cancelled. Stopping application."); stop_event.set()
                 except Exception as e:
-                    logger.error(f"Error waiting for trigger event in IDLE state: {e}", exc_info=True)
-                    await asyncio.sleep(1) # Pause before retry (loop continues)"""
-                current_state = AppState.CONNECTING
+                    logger.error(f"Error waiting for trigger event in IDLE: {e}", exc_info=True)
+                    await asyncio.sleep(1) # Pause before retry within IDLE
+
             elif current_state == AppState.CONNECTING:
                 print(">>> Current State: CONNECTING <<<", flush=True)
                 logger.info("Entered CONNECTING state.")
-                # Fetch credentials only when connecting
-                token, room_name = None, None # Reset before trying
+                token, room_name = None, None
                 try:
-                    device_id = get_or_create_device_id() # Assuming this is quick/sync
-                    username = "recDNsqLQ9CKswdVJ" # Example: Default user
+                    device_id = get_or_create_device_id()
+                    username = "recDNsqLQ9CKswdVJ" # TODO: Make configurable
                     logger.info(f"Fetching credentials for Device ID: {device_id}, User: {username}")
                     token, room_name = await get_credentials(device_id, username)
-
                     if token and room_name:
-                        logger.info("Credentials obtained successfully.")
-                        logger.info(f"LiveKit URL: {LIVEKIT_URL}, Room: {room_name}")
-                        # Create and start the client
-                        logger.info("Creating LightberryLocalClient instance...")
-                        # Stop passing stop_event to client, manage externally
-                        # client = LightberryLocalClient(LIVEKIT_URL, token, room_name, loop, stop_event)
-                        client = LightberryLocalClient(LIVEKIT_URL, token, room_name, loop, trigger_event_queue)
-                        logger.info("Starting client connection and processing...")
-                        await client.start() # Connects, publishes, starts IO/forwarding
+                        logger.info("Credentials obtained. Creating client...")
+                        client = LightberryLocalClient(url=LIVEKIT_URL, token=token, room_name=room_name,
+                                                   loop=loop, trigger_event_queue=trigger_event_queue,
+                                                   io_handler=persistent_io_handler)
+                        await client.start()
                         logger.info("Client started successfully.")
                         current_state = AppState.ACTIVE
                         print("Connected and Active!", flush=True)
                     else:
                         logger.error("Failed to obtain credentials.")
                         print("Connection failed (credentials). Returning to IDLE.", flush=True)
-                        current_state = AppState.IDLE
-                        await asyncio.sleep(2)
-
+                        current_state = AppState.IDLE ; await asyncio.sleep(2)
                 except Exception as e:
                     logger.error(f"Error during CONNECTING state: {e}", exc_info=True)
                     print(f"Connection failed ({type(e).__name__}). Returning to IDLE.", flush=True)
-                    if client:
-                        logger.info("Attempting to stop client after connection error...")
-                        try:
-                            await client.stop()
-                        except Exception as stop_err:
-                            logger.error(f"Error stopping client after connection failure: {stop_err}")
-                    client = None # Ensure client is None after failure
-                    current_state = AppState.IDLE
-                    await asyncio.sleep(5) # Wait longer after error
+                    if client: 
+                        try: await client.stop() 
+                        except Exception: pass
+                    client = None ; current_state = AppState.IDLE ; await asyncio.sleep(5)
 
             elif current_state == AppState.ACTIVE:
-                print(">>> Current State: ACTIVE <<< Mic Live | Single Press: Pause | Double Press: Stop", flush=True)
+                print(">>> Current State: ACTIVE <<< Mic Live | Trigger: Pause/Stop", flush=True)
                 logger.info("Entered ACTIVE state. Waiting for trigger.")
                 try:
-                    # Wait for next trigger (pause, stop, auto-pause, or disconnect)
                     event = await trigger_event_queue.get()
                     logger.info(f"Event received in ACTIVE state: {event.name}")
                     trigger_event_queue.task_done()
-
-                    # Treat FIRST_PRESS as manual pause
                     if event == TriggerEvent.FIRST_PRESS or event == TriggerEvent.SUBSEQUENT_PRESS:
-                        logger.info("Manual pause trigger received. Pausing client.")
+                        logger.info("Pause trigger received. Pausing client.")
                         print("Pausing...", flush=True)
-                        if client:
-                             await client.pause() # This now stops monitoring and pauses input
+                        if client: await client.pause()
                         current_state = AppState.PAUSED
-                    # Handle auto-pause event from IO Handler
                     elif event == TriggerEvent.AUTO_PAUSE:
-                         logger.info("Auto-pause event received due to silence. Transitioning to PAUSED state.")
-                         # IOHandler already paused input, just update state
+                         logger.info("Auto-pause event received. Pausing client.")
+                         print("Auto-pausing due to silence...", flush=True)
+                         if client: await client.pause()
                          current_state = AppState.PAUSED
                     elif event == TriggerEvent.DOUBLE_PRESS:
-                        logger.info("Stop trigger (double press) received. Stopping client.")
+                        logger.info("Stop trigger received. Stopping client.")
                         print("Stopping...", flush=True)
                         current_state = AppState.STOPPING
                     elif event == TriggerEvent.UNEXPECTED_DISCONNECT:
                          logger.warning("Unexpected disconnect event received. Stopping client.")
                          current_state = AppState.STOPPING
-                    else:
-                         logger.warning(f"Unexpected event '{event.name}' received in ACTIVE state.")
-
-                except asyncio.CancelledError:
-                    logger.info("ACTIVE state wait cancelled.")
-                    current_state = AppState.STOPPING
-                except Exception as e:
-                    logger.error(f"Error in ACTIVE state: {e}", exc_info=True)
-                    current_state = AppState.STOPPING # Stop on error?
+                    else: logger.warning(f"Unexpected event '{event.name}' in ACTIVE state.")
+                except asyncio.CancelledError: logger.info("ACTIVE state wait cancelled."); stop_event.set()
+                except Exception as e: logger.error(f"Error in ACTIVE state: {e}", exc_info=True); current_state = AppState.STOPPING
 
             elif current_state == AppState.PAUSED:
-                print(">>> Current State: PAUSED <<< ⏸️ | Single Press: Resume | Double Press: Stop", flush=True)
+                print(">>> Current State: PAUSED <<< ⏸️ | Trigger: Resume/Stop", flush=True)
                 logger.info("Entered PAUSED state. Waiting for trigger.")
                 try:
-                    # Wait for next trigger (resume, stop, or disconnect)
                     event = await trigger_event_queue.get()
                     logger.info(f"Event received in PAUSED state: {event.name}")
                     trigger_event_queue.task_done()
-
-                    # Treat FIRST_PRESS as toggle/resume when paused
                     if event == TriggerEvent.FIRST_PRESS or event == TriggerEvent.SUBSEQUENT_PRESS:
                         logger.info("Resume trigger received. Resuming client.")
                         print("Resuming...", flush=True)
-                        if client:
-                             await client.resume()
+                        if client: await client.resume()
                         current_state = AppState.ACTIVE
                     elif event == TriggerEvent.DOUBLE_PRESS:
-                        logger.info("Stop trigger (double press) received. Stopping client.")
+                        logger.info("Stop trigger received. Stopping client.")
                         print("Stopping...", flush=True)
                         current_state = AppState.STOPPING
                     elif event == TriggerEvent.UNEXPECTED_DISCONNECT:
-                         logger.warning("Unexpected disconnect event received while PAUSED. Stopping client.")
+                         logger.warning("Unexpected disconnect event while PAUSED. Stopping client.")
                          current_state = AppState.STOPPING
-                    # Ignore AUTO_PAUSE if already paused
-                    elif event == TriggerEvent.AUTO_PAUSE:
-                         logger.debug("Ignoring AUTO_PAUSE event while already PAUSED.")
-                    else:
-                         logger.warning(f"Unexpected event '{event.name}' received in PAUSED state.")
-
-                except asyncio.CancelledError:
-                    logger.info("PAUSED state wait cancelled.")
-                    current_state = AppState.STOPPING
-                except Exception as e:
-                    logger.error(f"Error in PAUSED state: {e}", exc_info=True)
-                    current_state = AppState.STOPPING # Stop on error?
+                    elif event == TriggerEvent.AUTO_PAUSE: logger.debug("Ignoring AUTO_PAUSE while PAUSED.")
+                    else: logger.warning(f"Unexpected event '{event.name}' in PAUSED state.")
+                except asyncio.CancelledError: logger.info("PAUSED state wait cancelled."); stop_event.set()
+                except Exception as e: logger.error(f"Error in PAUSED state: {e}", exc_info=True); current_state = AppState.STOPPING
 
             elif current_state == AppState.STOPPING:
                 print(">>> Current State: STOPPING <<<", flush=True)
-                logger.info("Entered STOPPING state.")
+                logger.info("Entered STOPPING state (stopping client only).")
                 if client:
                     logger.info("Stopping Lightberry client...")
-                    try:
-                        await client.stop() # This call now includes its own timeout handling
-                        logger.info("Client stopped.")
-                    except asyncio.TimeoutError:
-                         logger.error("Client stop timed out during STOPPING state.")
-                         # Continue shutdown even if client timed out
-                    except Exception as e:
-                         logger.error(f"Error stopping client: {e}", exc_info=True)
-                client = None # Clear client reference
-
-                if trigger_controller:
-                    logger.info("Stopping trigger listener...")
-                    try:
-                         trigger_controller.stop_listening()
-                         logger.info("Trigger listener stopped.")
-                    except Exception as e:
-                         logger.error(f"Error stopping trigger listener: {e}")
-                 # Don't stop the trigger controller instance itself, just the listener
-
+                    try: await client.stop()
+                    except Exception as e: logger.error(f"Error stopping client: {e}", exc_info=True)
+                client = None
                 logger.info("Transitioning back to IDLE state.")
                 current_state = AppState.IDLE
-                await asyncio.sleep(1) # Brief pause before restarting listener in IDLE
-                # REMOVED: stop_event.set()
-                # REMOVED: break
+                await asyncio.sleep(1)
 
             else:
                 logger.error(f"Reached unexpected state: {current_state}. Resetting to IDLE.")
+                current_state = AppState.IDLE ; await asyncio.sleep(1)
 
-            # Small sleep to prevent tight loop in case of unexpected state transitions or errors
-            # await asyncio.sleep(0.05)
-
-    except asyncio.CancelledError:
-         logger.info("Main loop task cancelled.")
-         # Ensure cleanup path is taken even on cancellation
-         current_state = AppState.STOPPING
+    except asyncio.CancelledError: logger.info("Main loop task cancelled.")
     except Exception as e:
-        logger.error(f"Unhandled exception in main state machine loop: {e}", exc_info=True)
-        current_state = AppState.STOPPING # Ensure cleanup path
+        logger.error(f"Unhandled exception in main loop: {e}", exc_info=True)
+        stop_event.set() # Ensure final cleanup
     finally:
         logger.info("Main function initiating final shutdown...")
         # Ensure cleanup, regardless of how the loop exited
