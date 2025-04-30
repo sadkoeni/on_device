@@ -9,6 +9,8 @@ echo "creating virtual environment"
 python -m venv venv
 echo "installing python dependencies"
 ./venv/bin/python -m pip install -r requirements.txt
+echo "Downloading openWakeWord models..."
+./venv/bin/python -c "import openwakeword; openwakeword.utils.download_models()" || { echo "Failed to download openWakeWord models. Exiting."; exit 1; }
 
 echo "renaming directory"
 #check if current directory is called lb, otherwise rename
