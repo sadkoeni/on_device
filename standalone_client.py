@@ -20,6 +20,10 @@ import enum # Added for Enums
 import queue # Standard library queue for thread interaction
 from openwakeword.model import Model
 import resampy # Import for resampling (will be used later)
+import websocket # Added for ElevenLabs WS
+import soundfile as sf # Added for resampling
+import io # Added for resampling
+import base64 # Added for ElevenLabs WS audio decoding
 # --- End Add necessary imports ---
 
 from livekit import rtc
@@ -73,11 +77,22 @@ TRINKEY_KEYCODE = bytes([1, 0, 0, 115, 0, 0, 0, 0, 0])
 DOUBLE_PRESS_TIMEOUT = 0.5 # Seconds to detect double press
 # --- End Trigger Configuration ---
 
+# --- ElevenLabs Configuration ---
+FALLBACK_API_KEY = "sk_cd7b19b436bf52c49f5c0b965ad3352e26ccefb6f188682d" # Placeholder for fallback
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", FALLBACK_API_KEY)
 
 logger = logging.getLogger("LightberryLocalClient")
 logger.info(f"Using standard audio sample rate: {LIVEKIT_SAMPLE_RATE}Hz") # Use standard rate
 # set logger level to info
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
+
+if ELEVENLABS_API_KEY == FALLBACK_API_KEY:
+    logger.warning(f"ELEVENLABS_API_KEY not set in environment. Using placeholder fallback key: '{FALLBACK_API_KEY}'. Wake phrase playback will likely fail unless this is replaced.")
+elif not ELEVENLABS_API_KEY: # Handles case where env var is set to an empty string
+    logger.warning("ELEVENLABS_API_KEY is set but empty. Wake phrase playback will fail.")
+# --- End ElevenLabs Configuration ---
+
+
 
 AUTH_API_URL = "https://lightberry.vercel.app/api/authenticate/{}" # Placeholder for device ID
 
@@ -85,15 +100,17 @@ def get_or_create_device_id() -> str:
     """Gets the device ID from a local file or creates a new one."""
     return DEVICE_ID
 
-async def get_credentials(device_id: str, username: str) -> tuple[Optional[str], Optional[str]]:
-    """Fetches LiveKit token and room name from the authentication API, with fallback."""
+async def get_credentials(device_id: str, username: str) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Fetches LiveKit token, room name, wake phrase and voice ID from the authentication API, with fallback."""
     url = AUTH_API_URL.format(device_id)
     payload = {"username": username, "x-device-api-key": username}
     logger.info(f"Attempting to fetch credentials from {url} for username '{username}'")
 
     # --- Define Fallback Credentials ---
     fallback_room_name = "lightberry"
-    fallback_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoiTGlnaHRiZXJyeSBBc3Npc3RhbnQiLCJ2aWRlbyI6eyJyb29tSm9pbiI6dHJ1ZSwicm9vbSI6ImxpZ2h0YmVycnkiLCJjYW5QdWJsaXNoIjp0cnVlLCJjYW5TdWJzY3JpYmUiOnRydWUsImNhblB1Ymxpc2hEYXRhIjp0cnVlfSwic3ViIjoidGVzdGVyIiwiaXNzIjoiQVBJM0VucVFRbTNqZEFYIiwibmJmIjoxNzQ1Nzg4NTY5LCJleHAiOjE3NDU4MTAxNjl9.JDMdxWZ6Qb6X3H_gCFsHfVJOItgAL0q6EWYp1zv6uO8" # Replace with a real temp token if available
+    fallback_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoiTGlnaHRiZXJyeSBBc3Npc3RhbnQiLCJ2aWRlbyI6eyJyb29tSm9pbiI6dHJ1ZSwicm9vbSI6ImxpZ2h0YmVycnkiLCJjYW5QdWJsaXNoIjp0cnVlLCJjYW5TdWJzY3JpYmUiOnRydWUsImNhblB1Ymxpc2hEYXRhIjp0cnVlfSwic3ViIjoidGVzdGVyIiwiaXNzIjoiQVBJM0VucVFRbTNqZEFYIiwibmJmIjoxNzQ1Nzg4NTY5LCJleHAiOjE3NDU4MTAxNjl9.JDMdxWZ6Qb6X3H_gCFsHfVJOItgAL0q6EWYp1zv6uO8"
+    fallback_wake_phrase = "Hi there."  # Default wake phrase
+    fallback_voice_id = "UgBBYS2sOqTuMpoF3BR0"  # Default voice ID (Rachel)
     # ---------------------------------
 
     try:
@@ -105,28 +122,30 @@ async def get_credentials(device_id: str, username: str) -> tuple[Optional[str],
                 if data.get("success"):
                     token = data.get("livekit_token")
                     room_name = data.get("room_name")
+                    wake_phrase = data.get("wake_phrase", fallback_wake_phrase)
+                    voice_id = data.get("voice_id", fallback_voice_id)
                     if token and room_name:
-                        logger.info(f"Successfully retrieved token and room name: {room_name}")
-                        return token, room_name
+                        logger.info(f"Successfully retrieved credentials: {room_name}")
+                        return token, room_name, wake_phrase, voice_id
                     else:
                         logger.error("API response missing token or room name. Using fallback.")
-                        return fallback_token, fallback_room_name
+                        return fallback_token, fallback_room_name, fallback_wake_phrase, fallback_voice_id
                 else:
                     error_msg = data.get("error", "Unknown error")
                     logger.error(f"API request failed: {error_msg}. Using fallback.")
-                    return fallback_token, fallback_room_name
+                    return fallback_token, fallback_room_name, fallback_wake_phrase, fallback_voice_id
     except aiohttp.ClientError as e:
         logger.error(f"HTTP request error during authentication: {e}. Using fallback.")
-        return fallback_token, fallback_room_name
+        return fallback_token, fallback_room_name, fallback_wake_phrase, fallback_voice_id
     except asyncio.TimeoutError:
         logger.error(f"Timeout connecting to authentication API at {url}. Using fallback.")
-        return fallback_token, fallback_room_name
+        return fallback_token, fallback_room_name, fallback_wake_phrase, fallback_voice_id
     except json.JSONDecodeError as e:
         logger.error(f"Failed to decode JSON response from authentication API: {e}. Using fallback.")
-        return fallback_token, fallback_room_name
+        return fallback_token, fallback_room_name, fallback_wake_phrase, fallback_voice_id
     except Exception as e:
         logger.error(f"An unexpected error occurred during credential fetching: {e}. Using fallback.", exc_info=True)
-        return fallback_token, fallback_room_name
+        return fallback_token, fallback_room_name, fallback_wake_phrase, fallback_voice_id
 
 # --- Trigger Controller Base Class ---
 class TriggerController(ABC):
@@ -199,6 +218,45 @@ def find_trinkey_path(vid: int, pid: int) -> Optional[str]:
         logger.error(f"Error enumerating HID devices: {e}")
         return None
 # --- End HID Listener Functions ---
+
+# --- Resampling Helper --- 
+TARGET_SAMPLE_RATE = LIVEKIT_SAMPLE_RATE # Define target rate (should be 48000)
+
+async def resample_audio_chunk(audio_data: bytes, source_rate: int, target_rate: int, logger_instance: Optional[logging.Logger] = None) -> bytes:
+    """Resamples an audio chunk using Librosa if source and target rates differ."""
+    effective_logger = logger_instance or logger
+    if source_rate == target_rate:
+        return audio_data
+    
+    # effective_logger.debug(f"Resampling audio from {source_rate}Hz to {target_rate}Hz...")
+    try:
+        # Use soundfile to read raw PCM data
+        data_io = io.BytesIO(audio_data)
+        # Assuming mono, 16-bit PCM. Adjust if format varies.
+        audio_array, _ = sf.read(data_io, dtype='int16', channels=1, samplerate=source_rate, format='RAW', subtype='PCM_16')
+
+        # Convert to float for librosa resampling
+        # Using resampy which is already imported, instead of librosa
+        audio_float = audio_array.astype(np.float32) / 32768.0 
+        # Resample using resampy
+        resampled_float = resampy.resample(audio_float, sr_orig=source_rate, sr_new=target_rate, filter='kaiser_fast')
+
+        # Convert back to int16
+        resampled_array = (resampled_float * 32768.0).astype(np.int16)
+
+        # Use soundfile to write back to bytes
+        resampled_bytes_io = io.BytesIO()
+        sf.write(resampled_bytes_io, resampled_array, target_rate, format='RAW', subtype='PCM_16')
+        resampled_bytes = resampled_bytes_io.getvalue()
+        # effective_logger.debug(f"Resampling complete. Input size: {len(audio_data)}, Output size: {len(resampled_bytes)}")
+        return resampled_bytes
+
+    except Exception as e:
+        effective_logger.error(f"Error during audio resampling: {e}", exc_info=True)
+        # Return original data on error to avoid crashing
+        return audio_data
+# --- End Resampling Helper --- 
+
 
 # --- Trinkey Trigger Implementation ---
 class TrinkeyTrigger(TriggerController):
@@ -526,6 +584,7 @@ class LocalIOHandler:
     """
     # Define constants for silence detection (can be moved later)
     SILENCE_THRESHOLD = 50  # Amplitude threshold (adjust based on mic sensitivity)
+    SILENCE_COUNT_THRESHOLD = 20 # Number of consecutive silent chunks to trigger end of speech
 
     def __init__(self,
                  loop: asyncio.AbstractEventLoop,
@@ -560,13 +619,7 @@ class LocalIOHandler:
         self._speaker_output_queue = asyncio.Queue(maxsize=200) # Async queue for output transfer coroutine
 
         # Create internal events
-        self._pause_input_event = asyncio.Event() # Gate for LiveKit input path
-        self._pause_wakeword_event = asyncio.Event() # Gate for WakeWord input path
         self._stop_event = asyncio.Event() # Global stop for internal loops
-
-        # Initialize event states
-        self._pause_input_event.clear() # LiveKit path starts paused
-        self._pause_wakeword_event.set() # Wake word path starts active
 
         # Initialize tasks
         self._input_dist_task: Optional[asyncio.Task] = None
@@ -574,7 +627,9 @@ class LocalIOHandler:
 
         # Initialize internal state tracking
         self._assistant_speaking: bool = False
+        self._livekit_input_enabled: bool = False
         self._playback_finished_event: Optional[asyncio.Event] = None
+        self._consecutive_silence_count: int = 0 # Add silence counter
         try:
             # Attempt to get the event from the owned output component
             if hasattr(self.audio_output, 'get_playback_finished_event'):
@@ -614,32 +669,24 @@ class LocalIOHandler:
         except Exception as e:
             self.logger.error(f"Error putting chunk into speaker output queue: {e}")
 
-    async def signal_client_connected(self):
-        """Called by the client when it has successfully connected and is ready for audio."""
-        self.logger.info("Client connected signal received. Enabling LiveKit input path.")
-        await self._empty_queue(self._livekit_input_queue) # Clear any stale chunks
-        self._pause_input_event.set() # Allow audio flow to client
-
     async def signal_client_disconnected(self):
         """Called by the client when it is disconnecting."""
         self.logger.info("Client disconnected signal received. Disabling LiveKit input path.")
-        self._pause_input_event.clear() # Stop audio flow to client path
-        await self._empty_queue(self._livekit_input_queue)
+        await self.disable_livekit_input() # Use new method
 
-    async def request_livekit_pause(self):
-        """Called by the client to request pausing the audio flow TO LiveKit."""
-        self.logger.info("Request received to pause LiveKit input path.")
-        self._pause_input_event.clear()
+    async def enable_livekit_input(self):
+        """Enable forwarding of microphone input to the LiveKit queue."""
+        if not self._livekit_input_enabled:
+            self.logger.info("Enabling LiveKit input path.")
+            await self._empty_queue(self._livekit_input_queue) # Clear stale data
+            self._livekit_input_enabled = True
 
-    async def request_livekit_resume(self):
-        """Called by the client to request resuming the audio flow TO LiveKit."""
-        self.logger.info("Request received to resume LiveKit input path.")
-        await self._empty_queue(self._livekit_input_queue) # Clear potential stale input
-        # Only resume if assistant is not speaking
-        if not self._assistant_speaking:
-             self._pause_input_event.set()
-        else:
-             self.logger.debug("Ignoring resume request as assistant is speaking.")
+    async def disable_livekit_input(self):
+        """Disable forwarding of microphone input to the LiveKit queue."""
+        if self._livekit_input_enabled:
+            self.logger.info("Disabling LiveKit input path.")
+            self._livekit_input_enabled = False
+            await self._empty_queue(self._livekit_input_queue) # Clear queue
 
     # --- Lifecycle Management (Called by main) ---
     async def start(self):
@@ -653,8 +700,6 @@ class LocalIOHandler:
             return
         self.logger.info("Starting LocalIOHandler...")
         self._stop_event.clear()
-        self._pause_input_event.clear() # Client not connected yet
-        self._pause_wakeword_event.set() # Wake word should be active
         self._assistant_speaking = False
         try:
             await self.audio_input.start()
@@ -700,7 +745,7 @@ class LocalIOHandler:
 
     # --- Internal Processing Loops ---
     async def _input_distribution_loop(self):
-        """Distributes audio from the single mic input to WakeWord and LiveKit queues."""
+        """Distributes audio from the single mic input based on flags."""
         self.logger.info("Input distribution loop started.")
         source_queue = None
         try:
@@ -716,14 +761,28 @@ class LocalIOHandler:
             try:
                 chunk_tuple = await asyncio.wait_for(source_queue.get(), timeout=0.5)
                 source_queue.task_done()
-                if self._pause_wakeword_event.is_set():
-                    try: self._wakeword_audio_queue.put_nowait(chunk_tuple)
-                    except queue.Full: self.logger.debug("WakeWord audio queue full, discarding chunk.")
-                    except Exception as e: self.logger.error(f"Error putting chunk to WakeWord queue: {e}")
-                if self._pause_input_event.is_set():
-                    try: self._livekit_input_queue.put_nowait(chunk_tuple)
-                    except asyncio.QueueFull: self.logger.warning("LiveKit input queue full, discarding chunk.")
-                    except Exception as e: self.logger.error(f"Error putting chunk to LiveKit input queue: {e}")
+
+                # Check assistant speaking flag first
+                if self._assistant_speaking:
+                    #self.logger.debug(f"Discarding mic chunk {(chunk_tuple[1] if len(chunk_tuple) > 1 else 'N/A')} because assistant is speaking.") # DEBUG
+                    continue # Skip this chunk entirely if assistant is speaking
+                
+                # If assistant not speaking, always try to queue for WakeWord
+                try: 
+                    self._wakeword_audio_queue.put_nowait(chunk_tuple)
+                except queue.Full: 
+                    self.logger.debug("WakeWord audio queue full, discarding chunk.")
+                except Exception as e: 
+                    self.logger.error(f"Error putting chunk to WakeWord queue: {e}")
+
+                # Also queue for LiveKit *only* if it's enabled by the state machine
+                if self._livekit_input_enabled:
+                    try:
+                        await self._livekit_input_queue.put(chunk_tuple) 
+                    except Exception as e: 
+                        self.logger.error(f"Error putting chunk to LiveKit input queue: {e}")
+                
+
             except asyncio.TimeoutError: continue
             except asyncio.CancelledError: self.logger.info("Input distribution loop cancelled."); break
             except Exception as e:
@@ -732,68 +791,81 @@ class LocalIOHandler:
         self.logger.info("Input distribution loop finished.")
 
     async def _transfer_output_loop(self):
-        """Reads from speaker queue, performs VAD, controls input pauses, sends to speaker."""
+        """Reads from speaker queue, manages _assistant_speaking flag, sends to speaker."""
         self.logger.info("Output transfer loop started.")
-        was_implicitly_paused = False
+        
         while not self._stop_event.is_set():
             try:
                 chunk = await asyncio.wait_for(self._speaker_output_queue.get(), timeout=0.2)
                 self._speaker_output_queue.task_done()
-                if chunk is None: continue
-                energy = 0.0 ; is_currently_speech = False
+                if chunk is None: continue 
+
+                # --- VAD Logic --- 
+                energy = 0.0
+                is_currently_speech = False
                 try:
                     if chunk:
                         audio_int16 = np.frombuffer(chunk, dtype=np.int16)
-                        if audio_int16.size > 0: energy = np.mean(np.abs(audio_int16)) + 1e-9; is_currently_speech = energy > self.SILENCE_THRESHOLD
-                except Exception as e: self.logger.error(f"OutputTransferLoop: Error calculating energy: {e}")
+                        if audio_int16.size > 0: 
+                            energy = np.mean(np.abs(audio_int16)) + 1e-9 # Add epsilon for safety
+                            is_currently_speech = energy > self.SILENCE_THRESHOLD
+                except ValueError as ve:
+                    # Handle potential value error from frombuffer if chunk size is wrong
+                    self.logger.error(f"OutputTransferLoop: ValueError calculating energy (likely chunk size issue): {ve}. Chunk size: {len(chunk)}")
+                    # Skip processing this chunk?
+                    continue 
+                except Exception as e: 
+                    self.logger.error(f"OutputTransferLoop: Error calculating energy: {e}")
+                    # Reset state or continue?
+                    continue
+                # --- End VAD Logic ---
 
-                if is_currently_speech and not self._assistant_speaking:
-                    self.logger.debug(f"Output VAD: Start of speech detected (Energy: {energy:.2f}).")
-                    self._assistant_speaking = True
-                    await self.audio_output.signal_start_of_speech()
-                    was_livekit_active_before_vad = self._pause_input_event.is_set()
-                    self._pause_input_event.clear()
-                    self._pause_wakeword_event.clear()
-                    was_implicitly_paused = was_livekit_active_before_vad
-                    self.logger.info("Assistant started speaking, pausing LiveKit & WakeWord input paths.")
-                elif not is_currently_speech and self._assistant_speaking:
-                    self.logger.debug("Output VAD: End of speech detected (silence). Waiting for playback.")
-                    self._assistant_speaking = False
-                    await self.audio_output.signal_end_of_speech()
-                    await self._wait_for_output_completion()
-                    self._pause_wakeword_event.set()
-                    if was_implicitly_paused:
-                        self._pause_input_event.set()
-                        self.logger.info("Assistant finished speaking, resuming WakeWord and LiveKit input paths.")
-                        await self._empty_queue(self._livekit_input_queue)
-                    else:
-                         self.logger.info("Assistant finished speaking, resuming WakeWord path. (LiveKit path remains paused).")
-                    was_implicitly_paused = False
-                if self._assistant_speaking:
-                    if hasattr(self, 'audio_output') and self.audio_output and hasattr(self.audio_output, 'send_audio_chunk'):
-                        await self.audio_output.send_audio_chunk(chunk)
-                    else: self.logger.warning("Cannot send chunk to speaker, audio_output invalid.")
+                # --- Manage _assistant_speaking flag --- 
+                if is_currently_speech:
+                    self._consecutive_silence_count = 0 
+                    if not self._assistant_speaking:
+                        # Transition: Silence -> Speech
+                        self.logger.debug(f"Output VAD: Start of speech detected (Energy: {energy:.2f}).")
+                        self._assistant_speaking = True
+                        await self.audio_output.signal_start_of_speech()
+                        # NO LONGER directly pauses input paths here
+                else: # Currently silent chunk
+                    if self._assistant_speaking:
+                        # Transition: Speech -> Potential Silence
+                        self._consecutive_silence_count += 1
+                        # ... (log silent chunk count) ...
+                        if self._consecutive_silence_count >= self.SILENCE_COUNT_THRESHOLD:
+                            # --- Trigger End of Speech --- 
+                            self.logger.info(f"Output VAD: End of speech detected ({self._consecutive_silence_count} consecutive silent chunks). Waiting for playback.")
+                            self._assistant_speaking = False # <<< Only change this flag
+                            self._consecutive_silence_count = 0 
+                            await self.audio_output.signal_end_of_speech()
+                            await self._wait_for_output_completion() 
+                            # NO LONGER resumes input paths here
+                            # --- End Trigger End of Speech --- 
+                        # else: Threshold not met
+                    # else: Silence -> Silence
+                    pass # Do nothing
+                # --- End Manage _assistant_speaking flag --- 
+
+                # --- Send chunk to speaker --- 
+                if hasattr(self, 'audio_output') and self.audio_output and hasattr(self.audio_output, 'send_audio_chunk'):
+                     await self.audio_output.send_audio_chunk(chunk)
+                else: 
+                     self.logger.warning("Cannot send chunk to speaker, audio_output invalid or doesn't support send_audio_chunk.")
+                # --- End Send chunk --- 
+
             except asyncio.TimeoutError:
                  if self._assistant_speaking:
+                     # Timeout implies end of speech
                      self.logger.info("Output VAD: End of speech detected (timeout). Waiting for playback.")
-                     self._assistant_speaking = False
+                     self._assistant_speaking = False # <<< Only change this flag
+                     self._consecutive_silence_count = 0 
                      await self.audio_output.signal_end_of_speech()
                      await self._wait_for_output_completion()
-                     self._pause_wakeword_event.set()
-                     if was_implicitly_paused:
-                          self._pause_input_event.set()
-                          self.logger.info("Assistant finished speaking (timeout), resuming WakeWord and LiveKit paths.")
-                          await self._empty_queue(self._livekit_input_queue)
-                     else:
-                          self.logger.info("Assistant finished speaking (timeout), resuming WakeWord path. (LiveKit path remains paused).")
-                     was_implicitly_paused = False
-                 continue
-            except asyncio.CancelledError: self.logger.info("Output transfer loop cancelled."); break
-            except Exception as e:
-                self.logger.error(f"Error in output transfer loop: {e}", exc_info=True)
-                self._assistant_speaking = False; was_implicitly_paused = False
-                if self._pause_wakeword_event: self._pause_wakeword_event.set()
-                await asyncio.sleep(0.1)
+                     # NO LONGER resumes input paths here
+                 continue # Continue loop after timeout
+            # ... (rest of exception handling) ...
         self.logger.info("Output transfer loop finished.")
 
     # --- Helper Methods ---
@@ -832,220 +904,217 @@ class LocalIOHandler:
         if emptied_count > 0: self.logger.debug(f"Emptied {emptied_count} items from queue.")
 
 
-# --- PyAudio Class (Keep Unchanged) ---
-class PyAudioMicrophoneInput(AudioInputInterface):
-    """AudioInputInterface that reads microphone audio using PyAudio and puts chunks onto a queue."""
-    def __init__(self,
-                 loop: asyncio.AbstractEventLoop,
-                 sample_rate: int = LIVEKIT_SAMPLE_RATE,
-                 logger_instance: Optional[Union[logging.Logger, 'logging.Logger']] = None,
-                 frames_per_buffer: int = PYAUDIO_CHUNK_SIZE,
-                 log_timing_cb: Optional[Callable] = None,
-                 get_chunk_id_cb: Optional[Callable] = None,
-                 input_device_index: Optional[int] = None): # Added input_device_index
-        self._loop = loop
-        self.logger = logger_instance or logger # Use passed logger or default
-        # Use provided sample_rate or the default
-        self._sample_rate = sample_rate
-        self.logger.info(f"PyAudioMicrophoneInput initialized with sample rate: {self._sample_rate}Hz")
-        self._audio_chunk_queue = asyncio.Queue(maxsize=500)
-        self._audio_task: Optional[asyncio.Task] = None
-        self._pyaudio_instance: Optional[pyaudio.PyAudio] = None
-        self._pyaudio_stream: Optional[pyaudio.Stream] = None
-        self._is_running = False
-        self._frames_per_buffer = frames_per_buffer
-        # Store callbacks
-        self._log_timing = log_timing_cb
-        self._get_chunk_id = get_chunk_id_cb
-        self._input_device_index = input_device_index # Store the index
-        if self._log_timing is None or self._get_chunk_id is None:
-            self.logger.warning("Timing/Chunk ID callbacks not provided to PyAudioMicrophoneInput. Detailed timing logs will be incomplete.")
-        if self._input_device_index is not None:
-             self.logger.info(f"Using specific input device index: {self._input_device_index}")
+# --- ElevenLabs WebSocket TTS --- 
+async def stream_wake_phrase(
+    text: str,
+    voice_id: str,
+    io_handler: LocalIOHandler,
+    logger_instance: Optional[logging.Logger] = None,
+    output_sample_rate: int = TARGET_SAMPLE_RATE # Use 48000 Hz
+):
+    """Streams TTS for a single wake phrase using ElevenLabs WebSocket.
 
-    async def start(self):
-        """Starts PyAudio processing."""
-        if self._is_running:
-            self.logger.warning("PyAudio input already running.")
-            return
-        self.logger.info("Starting PyAudio microphone input...")
-        self._is_running = True # Set running flag early
+    Connects, sends the text, streams PCM audio back, resamples, and sends 
+    to the IO handler's playback queue.
+    """
+    effective_logger = logger_instance or logger
+    effective_logger.info(f"Initiating WebSocket TTS for wake phrase: '{text[:30]}...'")
+
+    if not ELEVENLABS_API_KEY:
+        effective_logger.error("Cannot stream TTS: ELEVENLABS_API_KEY is not set.")
+        return
+
+    source_format = "pcm_24000" # Request 24kHz PCM from ElevenLabs
+    source_rate = 24000
+
+    ws_url = f"wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input?model_id=eleven_multilingual_v2&output_format={source_format}"
+
+    wsapp: Optional[websocket.WebSocketApp] = None
+    ws_thread: Optional[threading.Thread] = None
+    loop = asyncio.get_running_loop()
+    audio_processing_queue = asyncio.Queue(maxsize=100) # Queue for thread -> async communication
+    connected_event = asyncio.Event()
+    error_event = asyncio.Event()
+    closed_event = asyncio.Event()
+    received_final_message = asyncio.Event()
+    processing_error: Optional[Exception] = None
+    audio_task: Optional[asyncio.Task] = None
+
+    # --- WebSocket Callbacks (Run in dedicated thread) ---
+    def on_message_sync(wsapp_sync, message):
+        # Put raw message bytes/str onto the async queue
+        loop.call_soon_threadsafe(audio_processing_queue.put_nowait, message)
+
+    def on_error_sync(wsapp_sync, error):
+        nonlocal processing_error
+        effective_logger.error(f"ElevenLabs WS Error: {error}")
+        processing_error = Exception(f"WebSocket Error: {error}")
+        loop.call_soon_threadsafe(error_event.set)
+        # Also signal queue processor to stop
+        loop.call_soon_threadsafe(audio_processing_queue.put_nowait, None)
+
+    def on_close_sync(wsapp_sync, close_status_code, close_msg):
+        effective_logger.info(f"ElevenLabs WS Closed: {close_status_code} {close_msg}")
+        loop.call_soon_threadsafe(closed_event.set)
+        # Also signal queue processor to stop
+        loop.call_soon_threadsafe(audio_processing_queue.put_nowait, None)
+
+    def on_open_sync(wsapp_sync):
+        effective_logger.info("ElevenLabs WS Opened. Sending BOS and text...")
         try:
-            # Start the background task to read from PyAudio
-            self._audio_task = asyncio.create_task(self._audio_processing_loop(), name="PyAudioReader")
-            self.logger.info("PyAudio microphone input started successfully.")
+            # Send BOS
+            bos_message = {
+                "text": " ",
+                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+                "xi_api_key": ELEVENLABS_API_KEY,
+            }
+            wsapp_sync.send(json.dumps(bos_message))
 
+            # Send the actual text
+            text_message = {"text": text}
+            wsapp_sync.send(json.dumps(text_message))
+
+            # Send EOS
+            eos_message = {"text": ""}
+            wsapp_sync.send(json.dumps(eos_message))
+            effective_logger.debug("Sent BOS, text, and EOS to ElevenLabs.")
+            # Signal async side that connection is open and ready
+            loop.call_soon_threadsafe(connected_event.set)
         except Exception as e:
-            self.logger.error(f"Error starting PyAudio input: {e}", exc_info=True)
-            await self.stop() # Ensure cleanup on failed start
-            raise # Re-raise the exception
+            nonlocal processing_error
+            effective_logger.error(f"Error during WS open/send: {e}")
+            processing_error = e
+            loop.call_soon_threadsafe(error_event.set)
+            # Close connection on error during open
+            try: wsapp_sync.close() 
+            except: pass
 
-    async def _audio_processing_loop(self):
-        """Background task to read audio from PyAudio and feed the audio chunk queue."""
-        self.logger.info("PyAudio _audio_processing_loop task started execution.")
-        original_stderr = sys.stderr
+    # --- Async Task to Process Audio Messages --- 
+    async def process_audio_messages():
+        nonlocal processing_error
+        audio_chunks_processed = 0
         try:
-            # Initialize PyAudio and stream within the task's execution context
-            # --- Suppress stderr during PyAudio init ---
-            self.logger.debug("Initializing PyAudio instance for input...")
-            sys.stderr = open(os.devnull, 'w')
-            self._pyaudio_instance = await self._loop.run_in_executor(None, pyaudio.PyAudio)
-            sys.stderr = original_stderr # Restore stderr
-            self.logger.debug("PyAudio instance for input initialized.")
-            # --- End suppression ---
+            # Wait slightly longer for connection than default timeout?
+            await asyncio.wait_for(connected_event.wait(), timeout=10.0)
+            effective_logger.debug("Connection confirmed, starting audio processing loop.")
 
-            self.logger.info(f"Opening PyAudio input stream with SR={self._sample_rate}, Channels={PYAUDIO_CHANNELS}, Chunk={self._frames_per_buffer}, Device={self._input_device_index or 'Default'}") # Log device index
-            self._pyaudio_stream = await self._loop.run_in_executor(
-                None,
-                lambda: self._pyaudio_instance.open(
-                    format=PYAUDIO_FORMAT,
-                    channels=PYAUDIO_CHANNELS,
-                    rate=self._sample_rate, # Use the configured sample rate
-                    input=True,
-                    frames_per_buffer=self._frames_per_buffer,
-                    input_device_index=self._input_device_index # Pass the specific device index
-                )
-            )
-            self.logger.info("PyAudio stream opened for input.")
-
-            while self._is_running:
-                #self.logger.debug("PyAudio loop running...") # DEBUG
-                if not self._pyaudio_stream:
-                    self.logger.warning("Audio loop: Stream missing, stopping.")
+            while True:
+                message = await audio_processing_queue.get()
+                if message is None: # Stop signal
+                    effective_logger.debug("Audio processing task received stop signal.")
                     break
+
                 try:
-                    # Read chunk using the configured frames_per_buffer
-                    #self.logger.debug("PyAudio loop: Attempting to read chunk...") # DEBUG
-                    audio_chunk = await self._loop.run_in_executor(
-                        None,
-                        lambda: self._pyaudio_stream.read(self._frames_per_buffer, exception_on_overflow=False)
-                    )
-                    #self.logger.debug(f"PyAudio loop: Read chunk of size {len(audio_chunk)}") # DEBUG
+                    data = json.loads(message)
+                    if data.get("isFinal"):
+                        effective_logger.info(f"Received ElevenLabs isFinal. Processed {audio_chunks_processed} audio chunks.")
+                        received_final_message.set()
+                        break # Exit loop
 
-                    if not self._is_running: break # Check running flag after blocking read
+                    if "audio" in data and data["audio"]:
+                        audio_chunks_processed += 1
+                        raw_audio_data = base64.b64decode(data["audio"])
+                        if not raw_audio_data: continue
 
-                    # --- Add timing and put chunk (with metadata) onto queue ---
-                    chunk_id = -1 # Default value if ID callback fails
-                    t_capture = time.time()
-                    try:
-                        if self._get_chunk_id:
-                            chunk_id = self._get_chunk_id()
-                        # else: # Callback missing - chunk_id remains -1
-                        #     pass
+                        # Resample (will log errors internally)
+                        resampled_data = await resample_audio_chunk(raw_audio_data, source_rate, output_sample_rate, effective_logger)
 
-                        # Log mic capture time if timing callback exists
-                        if self._log_timing and chunk_id != -1:
-                            self._log_timing('mic_capture', chunk_id, timestamp=t_capture)
+                        if resampled_data:
+                            # Send to IO Handler playback queue
+                            await io_handler.play_audio_chunk(resampled_data)
+                        # else: resampling failed, logged in helper
 
-                        # Put chunk, ID, and capture time into queue as a tuple
-                        item_to_put = (audio_chunk, chunk_id, t_capture)
-
-                        try:
-                            # Use put_nowait for immediate check
-                            self._audio_chunk_queue.put_nowait(item_to_put)
-                        except asyncio.QueueFull:
-                            # If the queue is full (likely because IOHandler input is paused),
-                            # log that we are discarding the chunk.
-                            # Downgraded from WARNING to DEBUG as this is expected when paused
-                            self.logger.debug(f"PyAudio input queue full (likely paused), discarding chunk {chunk_id}.")
-                            if self._log_timing and chunk_id != -1:
-                                self._log_timing('discard_mic_q_full', chunk_id, timestamp=time.time())
-                            # No need to wait or retry, just drop the chunk by doing nothing else.
-                        # Removed TimeoutError handling as put_nowait raises QueueFull directly
-
-                    except Exception as e:
-                        # Catch potential errors from callbacks or queue logic
-                        self.logger.error(f"Error in PyAudio put logic for chunk {chunk_id}: {e}", exc_info=True)
-
-                    # -------------------------------------------------------------
-
-                    # Small yield (consider if necessary with executor calls)
-                    # await asyncio.sleep(0.001)
-
-                except IOError as e:
-                    # Log PyAudio errors, potentially break loop
-                    self.logger.error(f"PyAudio read error: {e}")
-                    if "Input overflowed" in str(e):
-                        self.logger.warning("Input overflow detected, continuing...")
-                        continue # Might be recoverable?
-                    else:
-                        break # Treat other IOErrors as fatal for this loop
+                except json.JSONDecodeError:
+                    effective_logger.warning(f"Ignoring invalid JSON from WS: {message[:100]}...")
                 except Exception as e:
-                    self.logger.error(f"Unexpected error in audio processing loop: {e}", exc_info=True)
-                    await asyncio.sleep(0.1) # Avoid tight loop on unexpected errors
+                    effective_logger.error(f"Error processing audio message: {e}", exc_info=True)
+                    processing_error = e
+                    error_event.set()
+                    break # Stop processing on error
+                finally:
+                    audio_processing_queue.task_done()
 
+        except asyncio.TimeoutError:
+            effective_logger.error("Timeout waiting for ElevenLabs WebSocket connection.")
+            processing_error = TimeoutError("ElevenLabs connection timeout")
+            error_event.set()
+        except asyncio.CancelledError:
+            effective_logger.info("Audio processing task cancelled.")
         except Exception as e:
-            self.logger.error(f"Fatal error initializing PyAudio stream: {e}", exc_info=True)
-            # Signal component failure? For now, just log.
+            effective_logger.error(f"Unexpected error in audio processing task: {e}", exc_info=True)
+            if not processing_error: processing_error = e
+            error_event.set()
         finally:
-            sys.stderr = original_stderr # Ensure stderr is restored even on error
-            self.logger.info("PyAudio processing loop finished. Cleaning up PyAudio resources...")
-            # Cleanup PyAudio stream and instance
-            stream = self._pyaudio_stream
-            pa_instance = self._pyaudio_instance
-            self._pyaudio_stream = None
-            self._pyaudio_instance = None
+            effective_logger.debug("Audio processing task finished.")
+            # Ensure final message event is set if loop finishes unexpectedly
+            if not received_final_message.is_set(): received_final_message.set()
 
-            if stream:
-                try:
-                    # Use run_in_executor for blocking PyAudio calls
-                    is_active = await self._loop.run_in_executor(None, stream.is_active)
-                    if is_active:
-                        await self._loop.run_in_executor(None, stream.stop_stream)
-                    await self._loop.run_in_executor(None, stream.close)
-                    self.logger.info("PyAudio stream closed.")
-                except Exception as e:
-                    self.logger.error(f"Error closing PyAudio stream: {e}")
-            if pa_instance:
-                try:
-                    await self._loop.run_in_executor(None, pa_instance.terminate)
-                    self.logger.info("PyAudio instance terminated.")
-                except Exception as e:
-                    self.logger.error(f"Error terminating PyAudio: {e}")
+    # --- Main Execution --- 
+    try:
+        # Start WebSocket connection in thread
+        websocket.enableTrace(False) # Disable noisy websocket trace logs
+        wsapp = websocket.WebSocketApp(ws_url,
+                                       on_open=on_open_sync,
+                                       on_message=on_message_sync,
+                                       on_error=on_error_sync,
+                                       on_close=on_close_sync)
+        
+        ws_thread = threading.Thread(target=wsapp.run_forever, 
+                                   kwargs={"ping_interval": 5, "ping_timeout": 4},
+                                   daemon=True,
+                                   name=f"WakePhraseTTS-{time.time():.0f}")
+        ws_thread.start()
 
-    def get_audio_chunk_queue(self) -> asyncio.Queue:
-        """Returns the queue where raw audio chunks (with metadata) are placed."""
-        return self._audio_chunk_queue
+        # Start the async message processor
+        audio_task = asyncio.create_task(process_audio_messages(), name="WakePhraseAudioProc")
 
-    async def stop(self):
-        """Stops the audio processing loop."""
-        if not self._is_running:
-            return
-        self.logger.info("Stopping PyAudio microphone input...")
-        self._is_running = False # Signal tasks to stop
+        # Wait for completion (final message) or error or close
+        # Use asyncio.wait for flexibility
+        tasks_to_wait = [
+            asyncio.create_task(received_final_message.wait(), name="WaitFinalMsg"),
+            asyncio.create_task(error_event.wait(), name="WaitError"),
+            asyncio.create_task(closed_event.wait(), name="WaitClosed")
+        ]
+        done, pending = await asyncio.wait(tasks_to_wait, return_when=asyncio.FIRST_COMPLETED, timeout=30.0) # Timeout for whole operation
+        
+        # Cancel pending wait tasks
+        for task in pending: task.cancel()
 
-        # 1. Cancel and wait for the audio processing task
-        if self._audio_task:
-            task = self._audio_task
-            self._audio_task = None
-            if not task.done():
-                self.logger.debug("Cancelling PyAudio processing task...")
-                task.cancel()
-                try:
-                    await asyncio.wait_for(task, timeout=5.0)
-                    self.logger.debug("PyAudio processing task finished.")
-                except asyncio.TimeoutError:
-                    self.logger.warning("Timeout waiting for PyAudio task to cancel.")
-                except asyncio.CancelledError:
-                    self.logger.debug("PyAudio task was cancelled successfully.")
-                except Exception as e:
-                    self.logger.error(f"Error waiting for PyAudio task: {e}")
+        # Check results
+        if error_event.is_set():
+            effective_logger.error(f"Wake phrase TTS failed due to WebSocket/Processing error: {processing_error}")
+        elif not received_final_message.is_set():
+            effective_logger.warning("Wake phrase TTS finished (or timed out) without receiving final message.")
+            # Check if closed event happened instead
+            if closed_event.is_set():
+                effective_logger.warning("WebSocket closed prematurely.")
+            else: # Likely timeout
+                 effective_logger.error("Timeout waiting for wake phrase TTS completion.")
+        else:
+            effective_logger.info("Wake phrase TTS stream completed successfully.")
 
-        # Clear the queue on stop
-        while not self._audio_chunk_queue.empty():
-            try:
-                item = self._audio_chunk_queue.get_nowait()
-                self._audio_chunk_queue.task_done()
-                # Log discarded item ID if timing enabled
-                # if self._log_timing and isinstance(item, tuple) and len(item) > 1:
-                #     self._log_timing('discard_mic_q_stop', item[1], timestamp=time.time())
-            except asyncio.QueueEmpty:
-                break
-            except Exception as e:
-                self.logger.error(f"Error clearing input audio queue during stop: {e}")
-                break
-
-        self.logger.info("PyAudio microphone input stopped.")
+    except Exception as e:
+        effective_logger.error(f"Overall exception during wake phrase streaming: {e}", exc_info=True)
+        error_event.set() # Signal error occurred
+    finally:
+        effective_logger.debug("Cleaning up wake phrase TTS resources...")
+        # Ensure audio processing task is cancelled if still running
+        if audio_task and not audio_task.done():
+            audio_task.cancel()
+            try: await asyncio.wait_for(audio_task, timeout=1.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError): pass
+            
+        # Close WebSocket
+        if wsapp:
+            try: wsapp.close()
+            except Exception as e_close: effective_logger.debug(f"Error closing wsapp: {e_close}")
+        # Join thread
+        if ws_thread and ws_thread.is_alive():
+            ws_thread.join(timeout=2.0)
+            if ws_thread.is_alive(): 
+                effective_logger.warning("Wake phrase TTS WebSocket thread did not exit cleanly.")
+        effective_logger.debug("Wake phrase TTS cleanup complete.")
+# --- End ElevenLabs WebSocket TTS ---
 
 # --- SoundDevice Class (Unchanged) ---
 class SoundDeviceSpeakerOutput(AudioOutputInterface): # Renamed class
@@ -1309,6 +1378,222 @@ class SoundDeviceSpeakerOutput(AudioOutputInterface): # Renamed class
          return self._playback_finished_event
 
 
+# --- PyAudio Class (Keep Unchanged) ---
+class PyAudioMicrophoneInput(AudioInputInterface):
+    """AudioInputInterface that reads microphone audio using PyAudio and puts chunks onto a queue."""
+    def __init__(self,
+                 loop: asyncio.AbstractEventLoop,
+                 sample_rate: int = LIVEKIT_SAMPLE_RATE,
+                 logger_instance: Optional[Union[logging.Logger, 'logging.Logger']] = None,
+                 frames_per_buffer: int = PYAUDIO_CHUNK_SIZE,
+                 log_timing_cb: Optional[Callable] = None,
+                 get_chunk_id_cb: Optional[Callable] = None,
+                 input_device_index: Optional[int] = None): # Added input_device_index
+        self._loop = loop
+        self.logger = logger_instance or logger # Use passed logger or default
+        # Use provided sample_rate or the default
+        self._sample_rate = sample_rate
+        self.logger.info(f"PyAudioMicrophoneInput initialized with sample rate: {self._sample_rate}Hz")
+        self._audio_chunk_queue = asyncio.Queue(maxsize=500)
+        self._audio_task: Optional[asyncio.Task] = None
+        self._pyaudio_instance: Optional[pyaudio.PyAudio] = None
+        self._pyaudio_stream: Optional[pyaudio.Stream] = None
+        self._is_running = False
+        self._frames_per_buffer = frames_per_buffer
+        # Store callbacks
+        self._log_timing = log_timing_cb
+        self._get_chunk_id = get_chunk_id_cb
+        self._input_device_index = input_device_index # Store the index
+        if self._log_timing is None or self._get_chunk_id is None:
+            self.logger.warning("Timing/Chunk ID callbacks not provided to PyAudioMicrophoneInput. Detailed timing logs will be incomplete.")
+        if self._input_device_index is not None:
+             self.logger.info(f"Using specific input device index: {self._input_device_index}")
+
+    async def start(self):
+        """Starts PyAudio processing."""
+        if self._is_running:
+            self.logger.warning("PyAudio input already running.")
+            return
+        self.logger.info("Starting PyAudio microphone input...")
+        self._is_running = True # Set running flag early
+        try:
+            # Start the background task to read from PyAudio
+            self._audio_task = asyncio.create_task(self._audio_processing_loop(), name="PyAudioReader")
+            self.logger.info("PyAudio microphone input started successfully.")
+
+        except Exception as e:
+            self.logger.error(f"Error starting PyAudio input: {e}", exc_info=True)
+            await self.stop() # Ensure cleanup on failed start
+            raise # Re-raise the exception
+
+    async def _audio_processing_loop(self):
+        """Background task to read audio from PyAudio and feed the audio chunk queue."""
+        self.logger.info("PyAudio _audio_processing_loop task started execution.")
+        original_stderr = sys.stderr
+        try:
+            # Initialize PyAudio and stream within the task's execution context
+            # --- Suppress stderr during PyAudio init ---
+            self.logger.debug("Initializing PyAudio instance for input...")
+            sys.stderr = open(os.devnull, 'w')
+            self._pyaudio_instance = await self._loop.run_in_executor(None, pyaudio.PyAudio)
+            sys.stderr = original_stderr # Restore stderr
+            self.logger.debug("PyAudio instance for input initialized.")
+            # --- End suppression ---
+
+            self.logger.info(f"Opening PyAudio input stream with SR={self._sample_rate}, Channels={PYAUDIO_CHANNELS}, Chunk={self._frames_per_buffer}, Device={self._input_device_index or 'Default'}") # Log device index
+            self._pyaudio_stream = await self._loop.run_in_executor(
+                None,
+                lambda: self._pyaudio_instance.open(
+                    format=PYAUDIO_FORMAT,
+                    channels=PYAUDIO_CHANNELS,
+                    rate=self._sample_rate, # Use the configured sample rate
+                    input=True,
+                    frames_per_buffer=self._frames_per_buffer,
+                    input_device_index=self._input_device_index # Pass the specific device index
+                )
+            )
+            self.logger.info("PyAudio stream opened for input.")
+
+            while self._is_running:
+                #self.logger.debug("PyAudio loop running...") # DEBUG
+                if not self._pyaudio_stream:
+                    self.logger.warning("Audio loop: Stream missing, stopping.")
+                    break
+                try:
+                    # Read chunk using the configured frames_per_buffer
+                    #self.logger.debug("PyAudio loop: Attempting to read chunk...") # DEBUG
+                    audio_chunk = await self._loop.run_in_executor(
+                        None,
+                        lambda: self._pyaudio_stream.read(self._frames_per_buffer, exception_on_overflow=False)
+                    )
+                    #self.logger.debug(f"PyAudio loop: Read chunk of size {len(audio_chunk)}") # DEBUG
+
+                    if not self._is_running: break # Check running flag after blocking read
+
+                    # --- Add timing and put chunk (with metadata) onto queue ---
+                    chunk_id = -1 # Default value if ID callback fails
+                    t_capture = time.time()
+                    try:
+                        if self._get_chunk_id:
+                            chunk_id = self._get_chunk_id()
+                        # else: # Callback missing - chunk_id remains -1
+                        #     pass
+
+                        # Log mic capture time if timing callback exists
+                        if self._log_timing and chunk_id != -1:
+                            self._log_timing('mic_capture', chunk_id, timestamp=t_capture)
+
+                        # Put chunk, ID, and capture time into queue as a tuple
+                        item_to_put = (audio_chunk, chunk_id, t_capture)
+
+                        try:
+                            # Use put_nowait for immediate check
+                            self._audio_chunk_queue.put_nowait(item_to_put)
+                        except asyncio.QueueFull:
+                            # If the queue is full (likely because IOHandler input is paused),
+                            # log that we are discarding the chunk.
+                            # Downgraded from WARNING to DEBUG as this is expected when paused
+                            self.logger.debug(f"PyAudio input queue full (likely paused), discarding chunk {chunk_id}.")
+                            if self._log_timing and chunk_id != -1:
+                                self._log_timing('discard_mic_q_full', chunk_id, timestamp=time.time())
+                            # No need to wait or retry, just drop the chunk by doing nothing else.
+                        # Removed TimeoutError handling as put_nowait raises QueueFull directly
+
+                    except Exception as e:
+                        # Catch potential errors from callbacks or queue logic
+                        self.logger.error(f"Error in PyAudio put logic for chunk {chunk_id}: {e}", exc_info=True)
+
+                    # -------------------------------------------------------------
+
+                    # Small yield (consider if necessary with executor calls)
+                    # await asyncio.sleep(0.001)
+
+                except IOError as e:
+                    # Log PyAudio errors, potentially break loop
+                    self.logger.error(f"PyAudio read error: {e}")
+                    if "Input overflowed" in str(e):
+                        self.logger.warning("Input overflow detected, continuing...")
+                        continue # Might be recoverable?
+                    else:
+                        break # Treat other IOErrors as fatal for this loop
+                except Exception as e:
+                    self.logger.error(f"Unexpected error in audio processing loop: {e}", exc_info=True)
+                    await asyncio.sleep(0.1) # Avoid tight loop on unexpected errors
+
+        except Exception as e:
+            self.logger.error(f"Fatal error initializing PyAudio stream: {e}", exc_info=True)
+            # Signal component failure? For now, just log.
+        finally:
+            sys.stderr = original_stderr # Ensure stderr is restored even on error
+            self.logger.info("PyAudio processing loop finished. Cleaning up PyAudio resources...")
+            # Cleanup PyAudio stream and instance
+            stream = self._pyaudio_stream
+            pa_instance = self._pyaudio_instance
+            self._pyaudio_stream = None
+            self._pyaudio_instance = None
+
+            if stream:
+                try:
+                    # Use run_in_executor for blocking PyAudio calls
+                    is_active = await self._loop.run_in_executor(None, stream.is_active)
+                    if is_active:
+                        await self._loop.run_in_executor(None, stream.stop_stream)
+                    await self._loop.run_in_executor(None, stream.close)
+                    self.logger.info("PyAudio stream closed.")
+                except Exception as e:
+                    self.logger.error(f"Error closing PyAudio stream: {e}")
+            if pa_instance:
+                try:
+                    await self._loop.run_in_executor(None, pa_instance.terminate)
+                    self.logger.info("PyAudio instance terminated.")
+                except Exception as e:
+                    self.logger.error(f"Error terminating PyAudio: {e}")
+
+    def get_audio_chunk_queue(self) -> asyncio.Queue:
+        """Returns the queue where raw audio chunks (with metadata) are placed."""
+        return self._audio_chunk_queue
+
+    async def stop(self):
+        """Stops the audio processing loop."""
+        if not self._is_running:
+            return
+        self.logger.info("Stopping PyAudio microphone input...")
+        self._is_running = False # Signal tasks to stop
+
+        # 1. Cancel and wait for the audio processing task
+        if self._audio_task:
+            task = self._audio_task
+            self._audio_task = None
+            if not task.done():
+                self.logger.debug("Cancelling PyAudio processing task...")
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=5.0)
+                    self.logger.debug("PyAudio processing task finished.")
+                except asyncio.TimeoutError:
+                    self.logger.warning("Timeout waiting for PyAudio task to cancel.")
+                except asyncio.CancelledError:
+                    self.logger.debug("PyAudio task was cancelled successfully.")
+                except Exception as e:
+                    self.logger.error(f"Error waiting for PyAudio task: {e}")
+
+        # Clear the queue on stop
+        while not self._audio_chunk_queue.empty():
+            try:
+                item = self._audio_chunk_queue.get_nowait()
+                self._audio_chunk_queue.task_done()
+                # Log discarded item ID if timing enabled
+                # if self._log_timing and isinstance(item, tuple) and len(item) > 1:
+                #     self._log_timing('discard_mic_q_stop', item[1], timestamp=time.time())
+            except asyncio.QueueEmpty:
+                break
+            except Exception as e:
+                self.logger.error(f"Error clearing input audio queue during stop: {e}")
+                break
+
+        self.logger.info("PyAudio microphone input stopped.")
+
+
 # --- LightberryLocalClient Modifications ---
 class LightberryLocalClient:
     # Note: Client is now transient, created/destroyed per connection cycle.
@@ -1371,7 +1656,6 @@ class LightberryLocalClient:
         try:
             await self.connect()
             if self._is_connected:
-                await self.io_handler.signal_client_connected()
                 await self._create_and_publish_mic_track()
                 if self._mic_audio_source:
                     self._is_paused = False
@@ -1444,22 +1728,37 @@ class LightberryLocalClient:
     # --- Pause/Resume Methods --- #
     async def pause(self):
         if self._is_paused: self.logger.debug("Client already paused."); return
-        # Only allow pause if connected?
-        # if not self._is_connected: self.logger.warning("Cannot pause, not connected."); return
-        self.logger.info("Requesting IO Handler to pause LiveKit input.")
+        self.logger.info("Requesting IO Handler to disable LiveKit input.") # Changed log
         self._is_paused = True
-        try: await self.io_handler.request_livekit_pause()
+        try: 
+            # await self.io_handler.request_livekit_pause() # REMOVED
+            await self.io_handler.disable_livekit_input() # Use new method
         except Exception as e: self.logger.error(f"Error requesting pause from IO Handler: {e}")
         self.logger.info("Client set to Paused state.")
 
     async def resume(self):
-        if not self._is_paused: self.logger.debug("Client is not paused."); return
-        # if not self._is_connected: self.logger.warning("Cannot resume, not connected."); return
-        self.logger.info("Requesting IO Handler to resume LiveKit input.")
-        self._is_paused = False
-        try: await self.io_handler.request_livekit_resume()
-        except Exception as e: self.logger.error(f"Error requesting resume from IO Handler: {e}")
-        self.logger.info("Client set to Resumed state.")
+        """Ensures the client is not paused and the LiveKit input path is enabled."""
+        
+        # Handle the client's internal paused state
+        if self._is_paused:
+            self.logger.info("Client was paused, setting internal state to resumed.")
+            self._is_paused = False
+        else:
+            # This path might be taken if called right after starting
+            self.logger.debug("Client resume called, but client was not internally marked as paused.")
+
+        # Always ensure the IO handler's LiveKit input path is enabled when resume is called.
+        # The enable_livekit_input method handles the check if it's already enabled.
+        self.logger.info("Requesting IO Handler to enable LiveKit input path.")
+        try: 
+            await self.io_handler.enable_livekit_input() # Use new method
+            self.logger.info("IO Handler LiveKit input path enabled (or already was).")
+        except Exception as e: 
+            self.logger.error(f"Error requesting enable_livekit_input from IO Handler: {e}")
+        
+        # Changed log to reflect action completion rather than just state setting
+        self.logger.info("Client resume action finished.")
+
 
     async def _create_and_publish_mic_track(self):
         if not self._room or not self._room.local_participant: self.logger.error("Cannot create mic track: Not connected/no participant."); return
@@ -1508,7 +1807,7 @@ class LightberryLocalClient:
                     else: self.logger.warning(f"Mic source None sending frame {chunk_id}. Stopping."); break
                     t_end_send = time.time()
                     self._log_timing('sent_livekit', chunk_id, timestamp=t_end_send, duration=t_end_send - t_start_send)
-                except asyncio.TimeoutError: continue
+                except asyncio.TimeoutError: self.logger.debug(f"_forward_mic_to_livekit: Timeout waiting for chunk.") # DEBUG
                 except asyncio.CancelledError: self.logger.info("Mic forwarding task cancelled."); break
                 except Exception as e:
                     log_chunk_id = chunk_id if 'chunk_id' in locals() else 'unknown'
@@ -1589,8 +1888,6 @@ async def main():
         level=logging.INFO, # Start with INFO level for client
         format='%(asctime)s %(levelname)s:%(name)s:%(message)s'
     )
-    # Configure numba logger if librosa is used heavily (optional here for now)
-    # logging.getLogger('numba').setLevel(logging.WARNING)
 
     if not LIVEKIT_URL:
         logger.error("LIVEKIT_URL not set in environment.")
@@ -1609,23 +1906,17 @@ async def main():
     ww_trigger: Optional[WakeWordTrigger] = None
     trinkey_trigger: Optional[TrinkeyTrigger] = None
     keyboard_trigger: Optional[MacKeyboardTrigger] = None
-    # --- End Persistent Components --- #
-
-    token: Optional[str] = None
-    room_name: Optional[str] = None
-    device_id: Optional[str] = None
-    username: Optional[str] = None
 
     # --- Instantiate Persistent IO Handler --- #
     try:
         persistent_io_handler = LocalIOHandler(
             loop=loop,
-            logger_instance=logger, # Pass main logger
-            trigger_event_queue=trigger_event_queue # Pass the shared queue
+            logger_instance=logger,
+            trigger_event_queue=trigger_event_queue
         )
     except Exception as e:
-         logger.error(f"FATAL: Failed to initialize LocalIOHandler: {e}", exc_info=True)
-         return # Cannot continue without IO handler
+        logger.error(f"FATAL: Failed to initialize LocalIOHandler: {e}", exc_info=True)
+        return
 
     # --- Instantiate Trigger Controllers --- #
     try:
@@ -1633,7 +1924,7 @@ async def main():
         ww_trigger = WakeWordTrigger(
             loop=loop,
             event_queue=trigger_event_queue,
-            io_handler=persistent_io_handler # Pass the handler instance
+            io_handler=persistent_io_handler
         )
         logger.info("WakeWordTrigger initialized.")
 
@@ -1642,43 +1933,38 @@ async def main():
             logger.info("Platform is Darwin, attempting MacKeyboardTrigger.")
             keyboard_trigger = MacKeyboardTrigger(loop, trigger_event_queue)
             if not hasattr(keyboard_trigger, '_listener_loop') or not _pynput_available:
-                 logger.warning("MacKeyboardTrigger unavailable or pynput failed. Trying Trinkey.")
-                 keyboard_trigger = None # Indicate failure
-                 # Attempt Trinkey as fallback only if Mac failed
-                 trinkey_trigger = TrinkeyTrigger(loop, trigger_event_queue, ADAFRUIT_VID, TRINKEY_PID, TRINKEY_KEYCODE)
-                 logger.info("TrinkeyTrigger initialized as fallback.")
+                logger.warning("MacKeyboardTrigger unavailable or pynput failed. Trying Trinkey.")
+                keyboard_trigger = None
+                trinkey_trigger = TrinkeyTrigger(loop, trigger_event_queue, ADAFRUIT_VID, TRINKEY_PID, TRINKEY_KEYCODE)
+                logger.info("TrinkeyTrigger initialized as fallback.")
             else:
-                 logger.info("MacKeyboardTrigger initialized successfully.")
+                logger.info("MacKeyboardTrigger initialized successfully.")
         else:
-             # Default to Trinkey on non-Darwin platforms
-             logger.info("Platform is not Darwin, attempting TrinkeyTrigger.")
-             trinkey_trigger = TrinkeyTrigger(loop, trigger_event_queue, ADAFRUIT_VID, TRINKEY_PID, TRINKEY_KEYCODE)
-             logger.info("TrinkeyTrigger initialized.")
+            logger.info("Platform is not Darwin, attempting TrinkeyTrigger.")
+            trinkey_trigger = TrinkeyTrigger(loop, trigger_event_queue, ADAFRUIT_VID, TRINKEY_PID, TRINKEY_KEYCODE)
+            logger.info("TrinkeyTrigger initialized.")
 
         # --- Select Active Trigger --- #
-        # TODO: Make this selection configurable (e.g., command line arg)
-        # For now, let's prioritize WakeWord if available, then keyboard, then trinkey
-        # This needs refinement based on desired default behavior
         if ww_trigger:
             active_trigger_controller = ww_trigger
         elif keyboard_trigger and _pynput_available:
-             active_trigger_controller = keyboard_trigger
+            active_trigger_controller = keyboard_trigger
         elif trinkey_trigger:
-             active_trigger_controller = trinkey_trigger
+            active_trigger_controller = trinkey_trigger
         else:
-             active_trigger_controller = None # No trigger available
+            active_trigger_controller = None
 
         if active_trigger_controller:
-             logger.info(f"Selected {active_trigger_controller.__class__.__name__} as the active trigger controller (for logging/debug).")
+            logger.info(f"Selected {active_trigger_controller.__class__.__name__} as the active trigger controller.")
         else:
-             logger.error("Could not initialize any functional trigger controller!")
-             if persistent_io_handler: await persistent_io_handler.stop()
-             return
+            logger.error("Could not initialize any functional trigger controller!")
+            if persistent_io_handler: await persistent_io_handler.stop()
+            return
 
     except Exception as e:
-         logger.error(f"FATAL: Error during trigger controller initialization: {e}", exc_info=True)
-         if persistent_io_handler: await persistent_io_handler.stop()
-         return
+        logger.error(f"FATAL: Error during trigger controller initialization: {e}", exc_info=True)
+        if persistent_io_handler: await persistent_io_handler.stop()
+        return
 
     # --- Main State Machine Loop ---
     try:
@@ -1689,31 +1975,28 @@ async def main():
                 print("\n>>> Current State: IDLE <<<", flush=True)
                 logger.info("Entered IDLE state.")
                 if client is not None:
-                     logger.warning("Client instance found in IDLE state, attempting stop...")
-                     try: await client.stop()
-                     except Exception as e: logger.error(f"Error stopping stale client: {e}")
-                     client = None
+                    logger.warning("Client instance found in IDLE state, attempting stop...")
+                    try: await client.stop()
+                    except Exception as e: logger.error(f"Error stopping stale client: {e}")
+                    client = None
                 try:
                     logger.info("Ensuring persistent IO handler is started...")
                     await persistent_io_handler.start()
-                    # --- Start ALL available trigger listeners --- #
                     logger.info("Starting all available trigger listeners...")
                     if ww_trigger:
-                         logger.debug("Starting WakeWordTrigger listener...")
-                         ww_trigger.start_listening()
+                        logger.debug("Starting WakeWordTrigger listener...")
+                        ww_trigger.start_listening()
                     if keyboard_trigger:
-                         logger.debug("Starting MacKeyboardTrigger listener...")
-                         keyboard_trigger.start_listening()
+                        logger.debug("Starting MacKeyboardTrigger listener...")
+                        keyboard_trigger.start_listening()
                     if trinkey_trigger:
-                         logger.debug("Starting TrinkeyTrigger listener...")
-                         trinkey_trigger.start_listening()
-                    # --- End Start ALL listeners --- #
+                        logger.debug("Starting TrinkeyTrigger listener...")
+                        trinkey_trigger.start_listening()
                 except Exception as e:
                     logger.error(f"Error starting persistent components/listeners: {e}. Stopping application.", exc_info=True)
                     stop_event.set() ; continue
 
                 print(f"Waiting for any trigger...", flush=True)
-                # Clear potential stale events
                 while not trigger_event_queue.empty():
                     try: stale_event = trigger_event_queue.get_nowait(); trigger_event_queue.task_done()
                     except asyncio.QueueEmpty: break
@@ -1729,13 +2012,13 @@ async def main():
                         print("Trigger received! Connecting...", flush=True)
                         current_state = AppState.CONNECTING
                     elif event == TriggerEvent.UNEXPECTED_DISCONNECT:
-                         logger.warning("Received UNEXPECTED_DISCONNECT in IDLE state. Ignoring.")
+                        logger.warning("Received UNEXPECTED_DISCONNECT in IDLE state. Ignoring.")
                     else:
                         logger.warning(f"Unexpected event '{event.name}' received in IDLE state. Ignoring.")
                 except asyncio.CancelledError: logger.info("IDLE state wait cancelled. Stopping application."); stop_event.set()
                 except Exception as e:
                     logger.error(f"Error waiting for trigger event in IDLE: {e}", exc_info=True)
-                    await asyncio.sleep(1) # Pause before retry within IDLE
+                    await asyncio.sleep(1)
 
             elif current_state == AppState.CONNECTING:
                 print(">>> Current State: CONNECTING <<<", flush=True)
@@ -1745,23 +2028,26 @@ async def main():
                     device_id = get_or_create_device_id()
                     username = "recDNsqLQ9CKswdVJ" # TODO: Make configurable
                     logger.info(f"Fetching credentials for Device ID: {device_id}, User: {username}")
-                    token, room_name = await get_credentials(device_id, username)
+                    # Fetch credentials, now including wake phrase and voice ID
+                    token, room_name, wake_phrase, voice_id = await get_credentials(device_id, username) # <<< MODIFY THIS LINE
                     if token and room_name:
                         logger.info("Credentials obtained. Creating client...")
                         client = LightberryLocalClient(url=LIVEKIT_URL, token=token, room_name=room_name,
                                                    loop=loop, trigger_event_queue=trigger_event_queue,
                                                    io_handler=persistent_io_handler)
-                        await client.start() # Connects, signals handler, starts client tasks
+                        await client.start()
                         logger.info("Client started successfully.")
+                        # --- Play Wake Phrase (WebSocket) ---
+                        await stream_wake_phrase(wake_phrase, voice_id, persistent_io_handler, logger_instance=logger) # <<< REPLACE OLD CALL WITH THIS
+                        # ----------------------------------
                         current_state = AppState.ACTIVE
-                        # --- Clear trigger queue after successful transition --- #
+                        await client.resume() # set livekit input path to enabled
                         logger.debug("Clearing trigger queue after activating client...")
                         while not trigger_event_queue.empty():
                             try: trigger_event_queue.get_nowait(); trigger_event_queue.task_done()
                             except asyncio.QueueEmpty: break
-                            except Exception: pass # Ignore other potential errors during clear
+                            except Exception: pass
                         logger.debug("Trigger queue cleared.")
-                        # ----------------------------------------------------- #
                         print("Connected and Active!", flush=True)
                     else:
                         logger.error("Failed to obtain credentials.")
@@ -1788,17 +2074,17 @@ async def main():
                         if client: await client.pause()
                         current_state = AppState.PAUSED
                     elif event == TriggerEvent.AUTO_PAUSE:
-                         logger.info("Auto-pause event received. Pausing client.")
-                         print("Auto-pausing due to silence...", flush=True)
-                         if client: await client.pause()
-                         current_state = AppState.PAUSED
+                        logger.info("Auto-pause event received. Pausing client.")
+                        print("Auto-pausing due to silence...", flush=True)
+                        if client: await client.pause()
+                        current_state = AppState.PAUSED
                     elif event == TriggerEvent.DOUBLE_PRESS:
                         logger.info("Stop trigger received. Stopping client.")
                         print("Stopping...", flush=True)
                         current_state = AppState.STOPPING
                     elif event == TriggerEvent.UNEXPECTED_DISCONNECT:
-                         logger.warning("Unexpected disconnect event received. Stopping client.")
-                         current_state = AppState.STOPPING
+                        logger.warning("Unexpected disconnect event received. Stopping client.")
+                        current_state = AppState.STOPPING
                     else: logger.warning(f"Unexpected event '{event.name}' in ACTIVE state.")
                 except asyncio.CancelledError: logger.info("ACTIVE state wait cancelled."); stop_event.set()
                 except Exception as e: logger.error(f"Error in ACTIVE state: {e}", exc_info=True); current_state = AppState.STOPPING
@@ -1820,8 +2106,8 @@ async def main():
                         print("Stopping...", flush=True)
                         current_state = AppState.STOPPING
                     elif event == TriggerEvent.UNEXPECTED_DISCONNECT:
-                         logger.warning("Unexpected disconnect event while PAUSED. Stopping client.")
-                         current_state = AppState.STOPPING
+                        logger.warning("Unexpected disconnect event while PAUSED. Stopping client.")
+                        current_state = AppState.STOPPING
                     elif event == TriggerEvent.AUTO_PAUSE: logger.debug("Ignoring AUTO_PAUSE while PAUSED.")
                     else: logger.warning(f"Unexpected event '{event.name}' in PAUSED state.")
                 except asyncio.CancelledError: logger.info("PAUSED state wait cancelled."); stop_event.set()
@@ -1846,51 +2132,42 @@ async def main():
     except asyncio.CancelledError: logger.info("Main loop task cancelled.")
     except Exception as e:
         logger.error(f"Unhandled exception in main loop: {e}", exc_info=True)
-        stop_event.set() # Ensure final cleanup
+        stop_event.set()
     finally:
         logger.info("Main function initiating final shutdown...")
-        # Ensure cleanup, regardless of how the loop exited
         if current_state != AppState.STOPPING:
-             logger.warning(f"Main loop exited unexpectedly from state {current_state.name}. Forcing STOPPING.")
+            logger.warning(f"Main loop exited unexpectedly from state {current_state.name}. Forcing STOPPING.")
 
-        # Define helper for final cleanup within timeout
         async def _perform_final_cleanup(client_instance, trigger_controller_instance):
             if client_instance:
                 logger.info("Performing final client stop...")
                 try:
-                    # stop() now has its own internal timeout
                     await client_instance.stop()
                 except asyncio.TimeoutError:
                     logger.error("Client stop timed out during final cleanup.")
-                    # Continue cleanup despite client timeout
                 except Exception as e:
                     logger.error(f"Error during final client stop: {e}", exc_info=True)
             if trigger_controller_instance:
-                 logger.info("Performing final trigger listener stop...")
-                 try:
-                      # stop_listening is synchronous, but give thread a moment
-                      trigger_controller_instance.stop_listening()
-                      # Brief sleep might help ensure thread sees the flag
-                      await asyncio.sleep(0.5)
-                 except Exception as e:
-                      logger.error(f"Error during final trigger stop: {e}")
+                logger.info("Performing final trigger listener stop...")
+                try:
+                    trigger_controller_instance.stop_listening()
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.error(f"Error during final trigger stop: {e}")
             logger.info("Final cleanup steps completed (within timeout check).")
 
-        # --- Graceful shutdown with timeout using wait_for ---
-        shutdown_timeout = 10.0 # Seconds
+        shutdown_timeout = 10.0
         try:
             logger.info(f"Attempting graceful shutdown (timeout: {shutdown_timeout}s)...")
-            await asyncio.wait_for(_perform_final_cleanup(client, trigger_controller), timeout=shutdown_timeout)
+            await asyncio.wait_for(_perform_final_cleanup(client, active_trigger_controller), timeout=shutdown_timeout)
             logger.info("Graceful shutdown completed or timed out okay.")
-
         except asyncio.TimeoutError:
-             logger.error(f"Graceful shutdown timed out after {shutdown_timeout}s. Forcing exit.")
-             os._exit(1) # Force exit
+            logger.error(f"Graceful shutdown timed out after {shutdown_timeout}s. Forcing exit.")
+            os._exit(1)
         except Exception as final_e:
-             logger.error(f"Exception during final shutdown sequence: {final_e}", exc_info=True)
-             logger.error("Attempting force exit after shutdown exception.")
-             os._exit(1) # Force exit
-        # --- End Graceful shutdown ---
+            logger.error(f"Exception during final shutdown sequence: {final_e}", exc_info=True)
+            logger.error("Attempting force exit after shutdown exception.")
+            os._exit(1)
 
         logger.info("Main function shutdown complete.")
 
@@ -1899,6 +2176,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received. Shutting down...")
-    # Note: General exceptions inside main() are caught within main itself.
-    # asyncio.run() will propagate exceptions, but we handle them internally.
     logger.info("Client execution finished.")
