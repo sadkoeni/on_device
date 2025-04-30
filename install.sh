@@ -11,6 +11,7 @@ echo "installing python dependencies"
 ./venv/bin/python -m pip install -r requirements.txt
 echo "Downloading openWakeWord models..."
 ./venv/bin/python -c "import openwakeword; openwakeword.utils.download_models()" || { echo "Failed to download openWakeWord models. Exiting."; exit 1; }
+./venv/bin/python setup.py build_ext --inplace || { echo "Failed to build c_resampler. Exiting."; exit 1; }
 
 echo "renaming directory"
 #check if current directory is called lb, otherwise rename

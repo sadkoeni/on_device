@@ -37,6 +37,8 @@ import logging
 import pyaudio
 import sounddevice as sd # Import sounddevice
 
+import c_resampler
+
 from interfaces import AudioInputInterface, AudioOutputInterface, IOHandlerInterface, InputProcessorInterface
 
 from constants import LIVEKIT_SAMPLE_RATE, PYAUDIO_CHUNK_SIZE, PYAUDIO_CHANNELS, PYAUDIO_FORMAT, LIVEKIT_CHANNELS
@@ -410,26 +412,13 @@ class WakeWordTrigger(TriggerController):
                 # --- Perform Prediction --- #
                 try:
                     # Convert raw bytes (assuming int16 @ 48kHz) to numpy array
-                    audio_int16_48k = np.frombuffer(chunk_data, dtype=np.int16)
 
-                    # --- Downsample using resampy --- #
-                    audio_int16_16k = np.array([], dtype=np.int16) # Default to empty
-                    if audio_int16_48k.size > 0:
-                        # Convert int16 to float32 for resampy
-                        audio_float_48k = audio_int16_48k.astype(np.float32) / 32768.0
-                        try:
-                            # Resample (using kaiser_fast for potentially better performance)
-                            audio_float_16k = resampy.resample(audio_float_48k, sr_orig=LIVEKIT_SAMPLE_RATE, sr_new=16000, filter='kaiser_fast')
-                            # Convert back to int16 for openwakeword
-                            audio_int16_16k = (audio_float_16k * 32768.0).astype(np.int16)
-                        except Exception as resample_err:
-                             self.logger.error(f"Error during resampling chunk {chunk_id}: {resample_err}")
-                             # audio_int16_16k remains empty on error
-                    # --------------------------------- #
-
-                    # Predict using the downsampled audio chunk
-                    audio_to_predict = audio_int16_16k # Use the resampled data
-                    if audio_to_predict.size > 0:
+                    # --- Downsample using custom C code --- #
+                    audio = c_resampler.decimate(chunk_data)
+                    audio_to_predict = np.frombuffer(audio, dtype=np.int16)
+                    
+                     
+                    if audio_to_predict.size>0:
                         self.oww_model.predict(audio_to_predict)
                         scores = self.oww_model.prediction_buffer
                         activation_score = scores.get(self.activation_word, [0.0])[-1]

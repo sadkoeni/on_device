@@ -4,8 +4,10 @@ import sys
 import signal
 
 import numpy as np
+import resampy  # Added for 48 k→16 k resampling
 import pyaudio
 from openwakeword.model import Model
+import c_resampler
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -25,14 +27,14 @@ def parse_args():
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=1280,
-        help="Number of audio frames per buffer read (default: 1280)",
+        default=480,  # 10 ms at 48 kHz
+        help="Number of audio frames per buffer read (default: 480)",
     )
     parser.add_argument(
         "--rate",
         type=int,
-        default=16000,
-        help="Sample rate in Hz (default: 16000)",
+        default=48000,
+        help="Sample rate in Hz (default: 48000)",
     )
     parser.add_argument(
         "--channels",
@@ -111,7 +113,9 @@ def main():
     while True:
         try:
             raw = stream.read(args.chunk_size, exception_on_overflow=False)
-            audio = np.frombuffer(raw, dtype=np.int16)
+            # Fast C decimation: 48 k→16 k
+            pcm16_bytes = c_resampler.decimate(raw)
+            audio = np.frombuffer(pcm16_bytes, dtype=np.int16)
         except OSError:
             # overflow or stream‐closed – just skip this frame
             continue
