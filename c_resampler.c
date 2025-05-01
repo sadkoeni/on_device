@@ -27,8 +27,38 @@ static PyObject* decimate(PyObject* self, PyObject* args) {
     return out_bytes;
 }
 
+// Add this function at the same level as the existing decimate function
+static PyObject* upsample_24k_to_48k(PyObject* self, PyObject* args) {
+    const char* in_buf;
+    Py_ssize_t in_len;
+    if (!PyArg_ParseTuple(args, "y#", &in_buf, &in_len)) {
+        return NULL;
+    }
+    
+    Py_ssize_t n_in_samples = in_len / 2;
+    Py_ssize_t n_out_samples = n_in_samples * 2;
+    Py_ssize_t out_len = n_out_samples * 2;
+    
+    const int16_t* src = (const int16_t*)in_buf;
+    PyObject* out_bytes = PyBytes_FromStringAndSize(NULL, out_len);
+    if (!out_bytes) return NULL;
+    int16_t* dst = (int16_t*)PyBytes_AS_STRING(out_bytes);
+    
+    for (Py_ssize_t i = 0; i < n_in_samples - 1; i++) {
+        dst[i*2] = src[i];
+        dst[i*2 + 1] = (int16_t)((src[i] + src[i + 1]) / 2);
+    }
+    
+    // Handle last sample
+    dst[(n_in_samples-1)*2] = src[n_in_samples-1];
+    dst[(n_in_samples-1)*2 + 1] = src[n_in_samples-1];
+    
+    return out_bytes;
+}
+
 static PyMethodDef ResamplerMethods[] = {
     {"decimate", decimate, METH_VARARGS, "Downsample by 3 (48k→16k)"},
+    {"upsample_24k_to_48k", upsample_24k_to_48k, METH_VARARGS, "Upsample 24k to 48k (1:2)"},
     {NULL, NULL, 0, NULL}
 };
 

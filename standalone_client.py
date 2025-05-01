@@ -225,37 +225,28 @@ def find_trinkey_path(vid: int, pid: int) -> Optional[str]:
 TARGET_SAMPLE_RATE = LIVEKIT_SAMPLE_RATE # Define target rate (should be 48000)
 
 async def resample_audio_chunk(audio_data: bytes, source_rate: int, target_rate: int, logger_instance: Optional[logging.Logger] = None) -> bytes:
-    """Resamples an audio chunk using Librosa if source and target rates differ."""
+    """Resamples an audio chunk using efficient methods based on rates."""
     effective_logger = logger_instance or logger
     if source_rate == target_rate:
         return audio_data
     
-    # effective_logger.debug(f"Resampling audio from {source_rate}Hz to {target_rate}Hz...")
     try:
-        # Use soundfile to read raw PCM data
+        # Fast path: 24kHz → 48kHz (TTS upsampling)
+        if source_rate == 24000 and target_rate == 48000:
+            return c_resampler.upsample_24k_to_48k(audio_data)
+        
+        # Keep existing resampy code as fallback for other rates
         data_io = io.BytesIO(audio_data)
-        # Assuming mono, 16-bit PCM. Adjust if format varies.
         audio_array, _ = sf.read(data_io, dtype='int16', channels=1, samplerate=source_rate, format='RAW', subtype='PCM_16')
-
-        # Convert to float for librosa resampling
-        # Using resampy which is already imported, instead of librosa
-        audio_float = audio_array.astype(np.float32) / 32768.0 
-        # Resample using resampy
+        audio_float = audio_array.astype(np.float32) / 32768.0
         resampled_float = resampy.resample(audio_float, sr_orig=source_rate, sr_new=target_rate, filter='kaiser_fast')
-
-        # Convert back to int16
         resampled_array = (resampled_float * 32768.0).astype(np.int16)
-
-        # Use soundfile to write back to bytes
         resampled_bytes_io = io.BytesIO()
         sf.write(resampled_bytes_io, resampled_array, target_rate, format='RAW', subtype='PCM_16')
-        resampled_bytes = resampled_bytes_io.getvalue()
-        # effective_logger.debug(f"Resampling complete. Input size: {len(audio_data)}, Output size: {len(resampled_bytes)}")
-        return resampled_bytes
-
+        return resampled_bytes_io.getvalue()
+        
     except Exception as e:
         effective_logger.error(f"Error during audio resampling: {e}", exc_info=True)
-        # Return original data on error to avoid crashing
         return audio_data
 # --- End Resampling Helper --- 
 
