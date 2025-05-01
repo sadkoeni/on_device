@@ -603,7 +603,7 @@ class LocalIOHandler:
         )
 
         # Create internal queues
-        self._wakeword_audio_queue = queue.Queue(maxsize=50) # Standard queue for WakeWord thread
+        self._wakeword_audio_queue = queue.Queue(maxsize=200) # Standard queue for WakeWord thread
         self._livekit_input_queue = asyncio.Queue(maxsize=200) # Async queue for Client coroutine
         self._speaker_output_queue = asyncio.Queue(maxsize=200) # Async queue for output transfer coroutine
 
