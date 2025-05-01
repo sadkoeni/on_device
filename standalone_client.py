@@ -19,10 +19,11 @@ import enum # Added for Enums
 # --- Add necessary imports ---
 import queue # Standard library queue for thread interaction
 from openwakeword.model import Model
-import resampy # Import for resampling (will be used later)
+# Move these to function scope: resampy, soundfile, io
+# import resampy # Import for resampling (will be used later)
 import websocket # Added for ElevenLabs WS
-import soundfile as sf # Added for resampling
-import io # Added for resampling
+# import soundfile as sf # Added for resampling
+# import io # Added for resampling
 import base64 # Added for ElevenLabs WS audio decoding
 # --- End Add necessary imports ---
 
@@ -234,6 +235,11 @@ async def resample_audio_chunk(audio_data: bytes, source_rate: int, target_rate:
         # Fast path: 24kHz → 48kHz (TTS upsampling)
         if source_rate == 24000 and target_rate == 48000:
             return c_resampler.upsample_24k_to_48k(audio_data)
+        
+        # Only import heavy libraries on fallback path
+        import resampy
+        import soundfile as sf
+        import io
         
         # Keep existing resampy code as fallback for other rates
         data_io = io.BytesIO(audio_data)
@@ -1868,6 +1874,14 @@ async def main():
         level=logging.INFO, # Start with INFO level for client
         format='%(asctime)s %(levelname)s:%(name)s:%(message)s'
     )
+    
+    # Try to use uvloop for better performance on Linux/macOS
+    try:
+        import uvloop
+        uvloop.install()
+        logger.info("Using uvloop for improved performance")
+    except ImportError:
+        logger.info("uvloop not available, using standard event loop")
 
     if not LIVEKIT_URL:
         logger.error("LIVEKIT_URL not set in environment.")
