@@ -25,7 +25,7 @@ import websocket # Added for ElevenLabs WS
 # import soundfile as sf # Added for resampling
 # import io # Added for resampling
 import base64 # Added for ElevenLabs WS audio decoding
-# --- End Add necessary imports ---
+import collections # Added for circular buffer
 
 from livekit import rtc
 from livekit import api
@@ -569,8 +569,14 @@ class LocalIOHandler:
     Designed to be persistent and managed by the main application loop.
     """
     # Define constants for silence detection (can be moved later)
-    SILENCE_THRESHOLD = 50  # Amplitude threshold (adjust based on mic sensitivity)
+    SILENCE_THRESHOLD = 20  # LOWERED threshold - much more sensitive to soft sounds
     SILENCE_COUNT_THRESHOLD = 20 # Number of consecutive silent chunks to trigger end of speech
+    # Added for early silence detection - increased for safety
+    FALLING_EDGE_BUFFER_FRAMES = 50  # Buffer frames (~500ms) after speech → silence transition
+    # Pre-speech buffer size - keep recent frames to capture wake word beginnings
+    PRE_SPEECH_BUFFER_SIZE = 10  # Keep ~100ms of audio before speech onset
+    # Debug toggle to disable silence detection completely
+    DISABLE_SILENCE_DETECTION = False  # Set to True to send all frames to wake word detector
 
     def __init__(self,
                  loop: asyncio.AbstractEventLoop,
@@ -600,7 +606,7 @@ class LocalIOHandler:
         )
 
         # Create internal queues
-        self._wakeword_audio_queue = queue.Queue(maxsize=200) # Standard queue for WakeWord thread
+        self._wakeword_audio_queue = queue.Queue(maxsize=50) # Standard queue for WakeWord thread
         self._livekit_input_queue = asyncio.Queue(maxsize=200) # Async queue for Client coroutine
         self._speaker_output_queue = asyncio.Queue(maxsize=200) # Async queue for output transfer coroutine
 
@@ -616,6 +622,15 @@ class LocalIOHandler:
         self._livekit_input_enabled: bool = False
         self._playback_finished_event: Optional[asyncio.Event] = None
         self._consecutive_silence_count: int = 0 # Add silence counter
+        
+        # New state variables for early silence detection in wake word path
+        self._is_speech_active = False        # Current speech state
+        self._silence_frame_count = 0         # Consecutive silent frames
+        self._frames_processed = 0            # Count for debug stats
+        self._frames_skipped = 0              # Count for debug stats
+        # Create circular buffer for pre-speech frames (stores recent silent frames)
+        self._pre_speech_buffer = collections.deque(maxlen=self.PRE_SPEECH_BUFFER_SIZE)
+        
         try:
             # Attempt to get the event from the owned output component
             if hasattr(self.audio_output, 'get_playback_finished_event'):
@@ -631,6 +646,18 @@ class LocalIOHandler:
             self.logger.error(f"Failed to get playback finished event: {e}", exc_info=True)
 
         self.logger.info("Persistent LocalIOHandler initialized.")
+
+    # --- Add helper method for silence detection ---
+    def _is_chunk_silent(self, audio_chunk: bytes) -> bool:
+        """Fast check if audio chunk is below silence threshold."""
+        # Convert bytes to int16 numpy array
+        audio_int16 = np.frombuffer(audio_chunk, dtype=np.int16)
+        
+        # Calculate absolute mean amplitude
+        energy = np.mean(np.abs(audio_int16))
+        
+        # Return True if below threshold
+        return energy < self.SILENCE_THRESHOLD
 
     # --- Public Interface for Client and Trigger ---
     def get_wakeword_audio_queue(self) -> queue.Queue:
@@ -733,6 +760,9 @@ class LocalIOHandler:
     async def _input_distribution_loop(self):
         """Distributes audio from the single mic input based on flags."""
         self.logger.info("Input distribution loop started.")
+        if self.DISABLE_SILENCE_DETECTION:
+            self.logger.warning("SILENCE DETECTION DISABLED - sending all frames to wake word")
+
         source_queue = None
         try:
             if hasattr(self.audio_input, 'get_audio_chunk_queue'):
@@ -743,31 +773,128 @@ class LocalIOHandler:
              self.logger.error(f"InputDistLoop: Failed to get source queue: {e}. Exiting.", exc_info=True) ; return
         if source_queue is None: self.logger.error("InputDistLoop: Source queue is None. Exiting.") ; return
 
+        # Variables for periodic stats logging
+        last_stats_time = time.time()
+        stats_interval = 60.0  # Log stats every minute
+        # Energy logging to debug threshold issues
+        last_energy_log_time = time.time()
+        energy_log_interval = 5.0  # Log energy levels every 5 seconds during debug
+
         while not self._stop_event.is_set():
             try:
                 chunk_tuple = await asyncio.wait_for(source_queue.get(), timeout=0.5)
                 source_queue.task_done()
+                self._frames_processed += 1
 
                 # Check assistant speaking flag first
                 if self._assistant_speaking:
-                    #self.logger.debug(f"Discarding mic chunk {(chunk_tuple[1] if len(chunk_tuple) > 1 else 'N/A')} because assistant is speaking.") # DEBUG
                     continue # Skip this chunk entirely if assistant is speaking
                 
-                # If assistant not speaking, always try to queue for WakeWord
-                try: 
-                    self._wakeword_audio_queue.put_nowait(chunk_tuple)
-                except queue.Full: 
-                    self.logger.debug("WakeWord audio queue full, discarding chunk.")
-                except Exception as e: 
-                    self.logger.error(f"Error putting chunk to WakeWord queue: {e}")
+                # Extract chunk data for silence check
+                chunk_data = chunk_tuple[0]
+                
+                # --- Check if silence detection is disabled ---
+                if self.DISABLE_SILENCE_DETECTION:
+                    # Always send all frames to wake word when disabled
+                    try:
+                        self._wakeword_audio_queue.put_nowait(chunk_tuple)
+                    except queue.Full:
+                        self.logger.debug("WakeWord audio queue full, discarding chunk.")
+                    except Exception as e:
+                        self.logger.error(f"Error putting chunk to WakeWord queue: {e}")
+                else:
+                    # --- Early Silence Detection for Wake Word Path ---
+                    # Check energy level of current chunk
+                    current_chunk_silent = self._is_chunk_silent(chunk_data)
+                    
+                    # Log energy levels periodically during debug
+                    if self.logger.isEnabledFor(logging.DEBUG):
+                        current_time = time.time()
+                        if current_time - last_energy_log_time > energy_log_interval:
+                            # Calculate energy level for debugging
+                            audio_int16 = np.frombuffer(chunk_data, dtype=np.int16)
+                            energy = np.mean(np.abs(audio_int16))
+                            self.logger.debug(f"Current audio energy: {energy:.1f}, threshold: {self.SILENCE_THRESHOLD}")
+                            last_energy_log_time = current_time
+                    
+                    # Always store silent frames in pre-speech buffer
+                    if current_chunk_silent and not self._is_speech_active:
+                        # Add to circular buffer when in silent state
+                        self._pre_speech_buffer.append(chunk_tuple)
+                    
+                    # State machine logic
+                    if current_chunk_silent:
+                        # Chunk is silent
+                        if self._is_speech_active:
+                            # We're in speech state but detected silence
+                            self._silence_frame_count += 1
+                            
+                            # Check if we've exceeded buffer length
+                            if self._silence_frame_count > self.FALLING_EDGE_BUFFER_FRAMES:
+                                # Transition to silent state after buffer period
+                                self._is_speech_active = False
+                                # Skip sending this frame to wake word (silence beyond buffer)
+                                self._frames_skipped += 1
+                                if self.logger.isEnabledFor(logging.DEBUG) and self._frames_skipped % 100 == 0:
+                                    self.logger.debug(f"Skipped {self._frames_skipped} silent frames")
+                            else:
+                                # Still in buffer period - send frame to wake word
+                                try: 
+                                    self._wakeword_audio_queue.put_nowait(chunk_tuple)
+                                except queue.Full: 
+                                    self.logger.debug("WakeWord audio queue full, discarding chunk.")
+                                except Exception as e: 
+                                    self.logger.error(f"Error putting chunk to WakeWord queue: {e}")
+                        else:
+                            # Already in silent state, skip sending to wake word
+                            self._frames_skipped += 1
+                    else:
+                        # Non-silent chunk detected
+                        if not self._is_speech_active:
+                            # Speech onset detected - transition to speech state
+                            self._is_speech_active = True
+                            self.logger.info("Speech onset detected - sending pre-speech buffer")
+                            
+                            # Send pre-speech buffer frames first to capture word beginnings
+                            for buffered_chunk in self._pre_speech_buffer:
+                                try:
+                                    self._wakeword_audio_queue.put_nowait(buffered_chunk)
+                                    if self.logger.isEnabledFor(logging.DEBUG):
+                                        self.logger.debug(f"Sent pre-speech buffer frame")
+                                except queue.Full:
+                                    self.logger.debug("WakeWord audio queue full, discarding pre-speech chunk.")
+                                except Exception as e:
+                                    self.logger.error(f"Error putting pre-speech chunk to WakeWord queue: {e}")
+                        
+                        # Reset silence counter
+                        self._silence_frame_count = 0
+                        
+                        # Always queue non-silent chunks for wake word
+                        try: 
+                            self._wakeword_audio_queue.put_nowait(chunk_tuple)
+                        except queue.Full: 
+                            self.logger.debug("WakeWord audio queue full, discarding chunk.")
+                        except Exception as e: 
+                            self.logger.error(f"Error putting chunk to WakeWord queue: {e}")
+                    # --- End Early Silence Detection ---
 
-                # Also queue for LiveKit *only* if it's enabled by the state machine
+                # Always queue for LiveKit *only* if it's enabled by the state machine
                 if self._livekit_input_enabled:
                     try:
                         await self._livekit_input_queue.put(chunk_tuple) 
                     except Exception as e: 
                         self.logger.error(f"Error putting chunk to LiveKit input queue: {e}")
                 
+                # Periodically log silence detection stats
+                current_time = time.time()
+                if current_time - last_stats_time > stats_interval:
+                    if self._frames_processed > 0:
+                        skip_percent = (self._frames_skipped / self._frames_processed) * 100
+                        self.logger.info(f"Silence detection stats: {self._frames_skipped}/{self._frames_processed} frames skipped ({skip_percent:.1f}%)")
+                    # Reset stats
+                    self._frames_processed = 0
+                    self._frames_skipped = 0
+                    last_stats_time = current_time
 
             except asyncio.TimeoutError: continue
             except asyncio.CancelledError: self.logger.info("Input distribution loop cancelled."); break
@@ -827,10 +954,7 @@ class LocalIOHandler:
                             self._consecutive_silence_count = 0 
                             await self.audio_output.signal_end_of_speech()
                             await self._wait_for_output_completion() 
-                            # NO LONGER resumes input paths here
                             # --- End Trigger End of Speech --- 
-                        # else: Threshold not met
-                    # else: Silence -> Silence
                     pass # Do nothing
                 # --- End Manage _assistant_speaking flag --- 
 
@@ -1191,12 +1315,6 @@ class SoundDeviceSpeakerOutput(AudioOutputInterface): # Renamed class
                 if chunk_bytes is None:
                     self.logger.debug("Playback worker received None sentinel (end of utterance).")
                     self._audio_queue.task_done()
-                    # Wait for stream to finish playing buffered data before setting event
-                    # This requires knowing when the stream is truly idle.
-                    # Sounddevice might not offer a direct async way.
-                    # A simpler approach: set event after a short delay or assume write is blocking enough.
-                    # Setting immediately after None might be too soon if internal buffers are large.
-                    # For now, set immediately as before, but be aware of potential inaccuracy.
                     self.logger.info("Setting playback finished event after processing None sentinel.")
                     self._playback_finished_event.set()
                     continue
@@ -1298,10 +1416,6 @@ class SoundDeviceSpeakerOutput(AudioOutputInterface): # Renamed class
             except Exception as e: # Catch errors from send_audio_chunk if any
                 self.logger.error(f"Error enqueuing None sentinel: {e}")
 
-            # Don't immediately set the finished event here. The worker sets it after processing None.
-            # if self._audio_queue.empty():
-            #      self.logger.debug("Audio queue empty after signaling end of speech, setting finished event.")
-            #      self._playback_finished_event.set()
 
 
     async def stop(self):
