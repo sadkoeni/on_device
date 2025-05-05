@@ -16,6 +16,7 @@ from datetime import datetime # Added import
 import sys # Import sys for stderr redirection
 from abc import ABC, abstractmethod # Added for Abstract Base Class
 import enum # Added for Enums
+import pathlib # Added pathlib for path handling
 
 from livekit import rtc
 from livekit import api
@@ -75,6 +76,23 @@ logger.info(f"Using standard audio sample rate: {LIVEKIT_SAMPLE_RATE}Hz") # Use 
 logger.setLevel(logging.INFO)
 
 AUTH_API_URL = "https://lightberry.vercel.app/api/authenticate/{}" # Placeholder for device ID
+
+# --- Add Audio Loading Function ---
+def load_raw_audio(filepath: Union[str, pathlib.Path]) -> Optional[bytes]:
+    """Loads raw audio data from a file."""
+    try:
+        path = pathlib.Path(filepath)
+        if not path.is_file():
+             logger.error(f"Raw audio file not found: {filepath}")
+             return None
+        with open(path, "rb") as f:
+             audio_data = f.read()
+        logger.info(f"Successfully loaded raw audio file: {filepath} ({len(audio_data)} bytes)")
+        return audio_data
+    except Exception as e:
+        logger.error(f"Error loading raw audio file {filepath}: {e}", exc_info=True)
+        return None
+# --- End Audio Loading Function ---
 
 def get_or_create_device_id() -> str:
     """Gets the device ID from a local file or creates a new one."""
@@ -2035,6 +2053,57 @@ class LightberryLocalClient:
         self.logger.info(f"Timing log reset. Next log will be: {self.timing_log_file_path}")
     # --- End Timing Methods ---
 
+    async def _play_raw_audio_helper(self, raw_audio_data: bytes):
+        """Internal helper to chunk and play raw audio data."""
+        try:
+            chunk_size = 960 # 10ms at 48kHz, 16-bit mono
+            total_bytes = len(raw_audio_data)
+            bytes_sent = 0
+            self.logger.debug(f"Starting playback of {total_bytes} bytes of raw local audio.")
+
+            # Use the speaker output's start/end signals
+            await self._speaker_output.signal_start_of_speech()
+
+            while bytes_sent < total_bytes:
+                chunk = raw_audio_data[bytes_sent : bytes_sent + chunk_size]
+                if not chunk:
+                    break
+                await self._speaker_output.send_audio_chunk(chunk)
+                bytes_sent += len(chunk)
+                # Yield control briefly to allow other tasks to run
+                await asyncio.sleep(0.001) # Sleep slightly less than chunk duration (10ms)
+
+            # Ensure end signal is sent
+            await self._speaker_output.signal_end_of_speech()
+            self.logger.debug("Finished playback of raw local audio.")
+
+        except asyncio.CancelledError:
+            self.logger.info("Local audio playback task cancelled.")
+            # Attempt to signal end of speech even on cancellation
+            try:
+                 await self._speaker_output.signal_end_of_speech()
+            except Exception:
+                 pass # Ignore errors during cleanup on cancellation
+        except Exception as e:
+            self.logger.error(f"Error during local raw audio playback: {e}", exc_info=True)
+            # Attempt to signal end of speech on error
+            try:
+                 await self._speaker_output.signal_end_of_speech()
+            except Exception:
+                 pass
+
+    async def play_local_raw_audio(self, audio_data: bytes):
+        """Plays raw audio data from a local file as a background task."""
+        if not self._speaker_output or not hasattr(self._speaker_output, '_is_running') or not self._speaker_output._is_running:
+             self.logger.warning("Speaker output not initialized or not running. Cannot play local audio.")
+             return
+        if not audio_data:
+             self.logger.warning("No audio data provided to play_local_raw_audio.")
+             return
+
+        # Create a task to run the playback helper concurrently
+        asyncio.create_task(self._play_raw_audio_helper(audio_data), name="PlayLocalRawAudioHelper")
+
 async def main():
     # --- Basic Setup ---
     logging.basicConfig(
@@ -2047,6 +2116,14 @@ async def main():
     if not LIVEKIT_URL:
         logger.error("LIVEKIT_URL not set in environment.")
         return # Return instead of exit(1)
+
+    # --- Load Pre-processed Audio ---
+    connect_clip_path = "connect_clip.raw"
+    connect_clip_data = load_raw_audio(connect_clip_path)
+    if connect_clip_data is None:
+         logger.warning(f"Could not load connection audio clip from {connect_clip_path}. Playback will be skipped.")
+    # --- End Load Audio ---
+
 
     # --- State Machine & Control Variables ---
     loop = asyncio.get_running_loop()
@@ -2105,18 +2182,7 @@ async def main():
             else:
                  logger.warning(f"Ignoring state change request from {current_state.name} to {new_state.name}")
 
-        # --- Instantiate IO Handler --- (Move after callback definition)
-        # This was implicitly done inside LightberryLocalClient before
-        # Now we might need to instantiate it here if we pass the callback?
-        # Let's check LightberryLocalClient init... yes, it creates it.
-        # We need to modify LightberryLocalClient to accept the callback
-        # OR pass the queue to IOHandler and emit an event (Simpler change)
-
-        # --- Let's use the event queue approach (Simpler Refactor) ---
-        # We'll add a new TriggerEvent.AUTO_PAUSE
-        # LocalIOHandler will emit this event when silence timeout occurs.
-        # The ACTIVE state handler will listen for this event.
-        # No callback needed.
+       
 
         while not stop_event.is_set():
             logger.debug(f"--- Main Loop: Current State = {current_state.name} ---")
@@ -2186,6 +2252,14 @@ async def main():
                         # Stop passing stop_event to client, manage externally
                         # client = LightberryLocalClient(LIVEKIT_URL, token, room_name, loop, stop_event)
                         client = LightberryLocalClient(LIVEKIT_URL, token, room_name, loop, trigger_event_queue)
+                        
+
+                        # --- Play Connection Sound ---
+                        if connect_clip_data:
+                             logger.info("Attempting to play connection sound...")
+                             # Don't await this, let it play in the background
+                             asyncio.create_task(client.play_local_raw_audio(connect_clip_data), name="PlayConnectClip")
+                        # --- End Play Sound ---
                         logger.info("Starting client connection and processing...")
                         await client.start() # Connects, publishes, starts IO/forwarding
                         logger.info("Client started successfully.")
