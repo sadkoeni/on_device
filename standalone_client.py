@@ -4,7 +4,8 @@ import platform # Added for platform detection
 from typing import Optional, Callable, Union, AsyncGenerator
 import numpy as np
 import time # Added time
-import json # Added json
+import orjson as json # Added json
+import binascii # Added for base64 encoding
 import uuid # Added for device ID
 import os.path # Added for device ID file path
 import aiohttp # Added for async HTTP requests
@@ -1125,7 +1126,7 @@ async def stream_wake_phrase(
 
                     if "audio" in data and data["audio"]:
                         audio_chunks_processed += 1
-                        raw_audio_data = base64.b64decode(data["audio"])
+                        raw_audio_data = binascii.a2b_base64(data["audio"])
                         if not raw_audio_data: continue
 
                         # Resample (will log errors internally)
