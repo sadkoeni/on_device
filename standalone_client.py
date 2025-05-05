@@ -655,6 +655,7 @@ class AudioIOHandler(IOHandlerInterface): # Implements IOHandlerInterface for Au
 # --- PyAudio Class (Unchanged) ---
 class PyAudioMicrophoneInput(AudioInputInterface):
     """AudioInputInterface that reads microphone audio using PyAudio and puts chunks onto a queue."""
+    SILENCE_THRESHOLD = 20
     def __init__(self,
                  loop: asyncio.AbstractEventLoop,
                  sample_rate: int = LIVEKIT_SAMPLE_RATE,
@@ -740,21 +741,25 @@ class PyAudioMicrophoneInput(AudioInputInterface):
                         None,
                         lambda: self._pyaudio_stream.read(self._frames_per_buffer, exception_on_overflow=False)
                     )
+                    if audio_chunk:
+                        audio_int16 = np.frombuffer(audio_chunk, dtype=np.int16)
+                        if audio_int16.size > 0: 
+                            energy = np.mean(np.abs(audio_int16)) + 1e-9 # Add epsilon for safety
+                            if energy < self.SILENCE_THRESHOLD:
+                                self.logger.debug(f"PyAudio loop: Read chunk with low energy, skipping. Energy: {energy}")
+                                continue
                     #self.logger.debug(f"PyAudio loop: Read chunk of size {len(audio_chunk)}") # DEBUG
 
                     if not self._is_running: break # Check running flag after blocking read
 
                     # --- Add timing and put chunk (with metadata) onto queue ---
                     chunk_id = -1 # Default value if ID callback fails
-                    t_capture = time.time()
+                    t_capture = 1
                     try:
                         if self._get_chunk_id:
                             chunk_id = self._get_chunk_id()
                         else:
                             self.logger.warning("Chunk ID callback missing, cannot get ID.")
-
-                        if self._log_timing and chunk_id != -1:
-                            self._log_timing('mic_capture', chunk_id, timestamp=t_capture)
 
                         # Put chunk, ID, and capture time into queue as a tuple
                         item_to_put = (audio_chunk, chunk_id, t_capture)
@@ -1336,7 +1341,7 @@ class LocalIOHandler(AudioIOHandler):
         await self._clear_input_buffers()
 
         # Save Timing Data
-        if hasattr(self._client, 'save_timing_data'):
+        if False and hasattr(self._client, 'save_timing_data'):
             self.logger.info("IOHandler: Saving collected timing data...")
             self._client.save_timing_data()
             self.logger.info("IOHandler: Timing data saved.")
@@ -1998,6 +2003,7 @@ class LightberryLocalClient:
     def save_timing_data(self):
         # No async lock needed if called only from signal_end_of_speech in IOHandler's task
         # Safeguard against None path
+        return #remove actual timing saving for latency reasons.
         if self.timing_log_file_path is None:
             self.logger.warning("save_timing_data called with None path, generating new path...")
             self.timing_log_file_path = self._generate_timing_log_path()
