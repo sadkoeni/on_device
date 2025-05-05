@@ -4,8 +4,8 @@ After=network.target # Or potentially network-online.target if it needs network 
 
 [Service]
 User=root
-WorkingDirectory=/home/lightberry-01/lb
-ExecStart=/home/lightberrydev/lb/venv/bin/python /home/lightberry-01/lb/standalone_client.py
+WorkingDirectory=/home/lightberrydev/lb
+ExecStart=/home/lightberrydev/lb/venv/bin/python /home/lightberrydev/lb/standalone_client.py
 Restart=on-failure
 RestartSec=5
 
