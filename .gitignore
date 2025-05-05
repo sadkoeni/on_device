@@ -1,2 +1,3 @@
 *.mpy
+.env
 key
