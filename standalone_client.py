@@ -228,6 +228,8 @@ TARGET_SAMPLE_RATE = LIVEKIT_SAMPLE_RATE # Define target rate (should be 48000)
 async def resample_audio_chunk(audio_data: bytes, source_rate: int, target_rate: int, logger_instance: Optional[logging.Logger] = None) -> bytes:
     """Resamples an audio chunk using efficient methods based on rates."""
     effective_logger = logger_instance or logger
+    source_rate = int(source_rate)
+    target_rate = int(target_rate)
     if source_rate == target_rate:
         return audio_data
     
