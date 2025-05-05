@@ -1,7 +1,7 @@
 echo "Updating package list..."
 #sudo apt-get update || { echo "apt-get update failed. Exiting."; exit 1; }
 
-sudo apt-get install -y vim || { echo "Failed to install vim"}
+sudo apt-get install -y vim || { echo "Failed to install vim"; exit 1; }
 echo "Installing Portaudio (dependency for pyaudio and sounddevice)"
 sudo apt-get install -y portaudio19-dev || { echo "Failed to install portaudio19-dev. Exiting."; exit 1; }
 sudo apt-get install -y build-essential python3-dev || { echo "Failed to install python3-dev. Exiting."; exit 1; }
@@ -41,6 +41,4 @@ sudo systemctl daemon-reload
 sudo systemctl enable lightberry || { echo "Failed to enable lightberry. Exiting."; exit 1; }
 sudo systemctl enable btwifiset.service|| { echo "Failed to enable bt-wifi-config. Exiting."; exit 1; }
 sudo systemctl enable gitpull || { echo "Failed to enable gitpull. Exiting."; exit 1; }
-
 sudo systemctl start btwifiset.service
-
