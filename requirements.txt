@@ -1,4 +1,5 @@
 numpy
+orjson
 aiohttp
 hidapi
 livekit
