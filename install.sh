@@ -45,3 +45,5 @@ sudo systemctl start btwifiset.service
 
 curl -fsSL https://tailscale.com/install.sh | sh
 sudo tailscale up
+amixer -D pulse sset Master unmute 100%
+amixer sset Master unmute 100%

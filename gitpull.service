@@ -3,8 +3,8 @@ Description=Lightberry Standalone Client Service
 After=network.target # Or potentially network-online.target if it needs network immediately
 
 [Service]
-User=lightberry-01
-WorkingDirectory=/home/lightberry-01/lb/on_device
+User=lightberrydev
+WorkingDirectory=/home/lightberrydev/lb/on_device
 ExecStart=/usr/bin/git pull
 
 [Install]
