@@ -20,6 +20,8 @@ import pathlib # Added pathlib for path handling
 
 from livekit import rtc
 from livekit import api
+from dotenv import load_dotenv
+load_dotenv()
 
 import asyncio
 import time

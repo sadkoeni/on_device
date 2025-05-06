@@ -8,3 +8,9 @@ websockets
 websocket-client
 requests>=2.25.1
 PyAudio
+orjson
+openwakeword
+resampy
+soundfile
+pynput
+dotenv
