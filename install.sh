@@ -42,3 +42,6 @@ sudo systemctl enable lightberry || { echo "Failed to enable lightberry. Exiting
 sudo systemctl enable btwifiset.service|| { echo "Failed to enable bt-wifi-config. Exiting."; exit 1; }
 sudo systemctl enable gitpull || { echo "Failed to enable gitpull. Exiting."; exit 1; }
 sudo systemctl start btwifiset.service
+
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
