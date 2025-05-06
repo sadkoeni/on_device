@@ -1,5 +1,5 @@
 echo "Updating package list..."
-#sudo apt-get update || { echo "apt-get update failed. Exiting."; exit 1; }
+sudo apt-get update || { echo "apt-get update failed. Exiting."; exit 1; }
 
 sudo apt-get install -y vim || { echo "Failed to install vim"; exit 1; }
 echo "Installing Portaudio (dependency for pyaudio and sounddevice)"
