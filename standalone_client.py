@@ -111,8 +111,8 @@ async def get_credentials(device_id: str, username: str) -> tuple[Optional[str],
     # --- Define Fallback Credentials ---
     fallback_room_name = "lightberry"
     fallback_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoiTGlnaHRiZXJyeSBBc3Npc3RhbnQiLCJ2aWRlbyI6eyJyb29tSm9pbiI6dHJ1ZSwicm9vbSI6ImxpZ2h0YmVycnkiLCJjYW5QdWJsaXNoIjp0cnVlLCJjYW5TdWJzY3JpYmUiOnRydWUsImNhblB1Ymxpc2hEYXRhIjp0cnVlfSwic3ViIjoidGVzdGVyIiwiaXNzIjoiQVBJM0VucVFRbTNqZEFYIiwibmJmIjoxNzQ1Nzg4NTY5LCJleHAiOjE3NDU4MTAxNjl9.JDMdxWZ6Qb6X3H_gCFsHfVJOItgAL0q6EWYp1zv6uO8"
-    fallback_wake_phrase = "Hi there."  # Default wake phrase
-    fallback_voice_id = "UgBBYS2sOqTuMpoF3BR0"  # Default voice ID (Rachel)
+    fallback_wake_phrase = "Hello Sir."  # Default wake phrase
+    fallback_voice_id = "NNl6r8mD7vthiJatiJt1"  # Default voice ID (Bradford)
     # ---------------------------------
 
     try:
