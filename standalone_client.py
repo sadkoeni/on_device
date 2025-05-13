@@ -20,11 +20,7 @@ import enum # Added for Enums
 # --- Add necessary imports ---
 import queue # Standard library queue for thread interaction
 from openwakeword.model import Model
-# Move these to function scope: resampy, soundfile, io
-# import resampy # Import for resampling (will be used later)
 import websocket # Added for ElevenLabs WS
-# import soundfile as sf # Added for resampling
-# import io # Added for resampling
 import base64 # Added for ElevenLabs WS audio decoding
 import collections # Added for circular buffer
 
@@ -338,7 +334,7 @@ class WakeWordTrigger(TriggerController):
                  loop: asyncio.AbstractEventLoop,
                  event_queue: asyncio.Queue,
                  io_handler: 'LocalIOHandler', # Reference to the IO Handler
-                 activation_word: str = "lightberry",        # Changed default activation word
+                 activation_word: str = "Hi_Bradford",        # Changed default activation word
                  stop_word: str = "lightberry_restart",    # Changed default stop word
                  threshold: float = 0.5):
         super().__init__(loop, event_queue)
@@ -370,7 +366,7 @@ class WakeWordTrigger(TriggerController):
             # Use ONNX framework and specify only the required models by path
             inference_framework = 'onnx'
             custom_model_paths = [
-                f"wakeword_models/lightberry.{inference_framework}", 
+                f"wakeword_models/Hi_Bradford.{inference_framework}", 
                 f"wakeword_models/lightberry_restart.{inference_framework}"
             ]
             self.oww_model = Model(
@@ -951,14 +947,13 @@ class LocalIOHandler:
                     if self._assistant_speaking:
                         # Transition: Speech -> Potential Silence
                         self._consecutive_silence_count += 1
-                        # ... (log silent chunk count) ...
                         if self._consecutive_silence_count >= self.SILENCE_COUNT_THRESHOLD:
                             # --- Trigger End of Speech --- 
                             self.logger.info(f"Output VAD: End of speech detected ({self._consecutive_silence_count} consecutive silent chunks). Waiting for playback.")
-                            self._assistant_speaking = False # <<< Only change this flag
                             self._consecutive_silence_count = 0 
                             await self.audio_output.signal_end_of_speech()
                             await self._wait_for_output_completion() 
+                            self._assistant_speaking = False # <<< Only change this flag
                             # --- End Trigger End of Speech --- 
                     pass # Do nothing
                 # --- End Manage _assistant_speaking flag --- 
@@ -978,9 +973,7 @@ class LocalIOHandler:
                      self._consecutive_silence_count = 0 
                      await self.audio_output.signal_end_of_speech()
                      await self._wait_for_output_completion()
-                     # NO LONGER resumes input paths here
                  continue # Continue loop after timeout
-            # ... (rest of exception handling) ...
         self.logger.info("Output transfer loop finished.")
 
     # --- Helper Methods ---
@@ -1321,7 +1314,12 @@ class SoundDeviceSpeakerOutput(AudioOutputInterface): # Renamed class
                     self.logger.debug("Playback worker received None sentinel (end of utterance).")
                     self._audio_queue.task_done()
                     self.logger.info("Setting playback finished event after processing None sentinel.")
+                    self.logger.info("Stopping sounddevice stream...")
+                    await self._loop.run_in_executor(None, self._stream.stop) # wait for output to finish
+                    self.logger.info("Sounddevice stream stopped. Setting _playback_finished_event.")
                     self._playback_finished_event.set()
+                    self.logger.info("restarting stream...")
+                    self._stream.start() # restart the stream
                     continue
 
                 # --- Process normal audio chunk ---
@@ -1342,9 +1340,6 @@ class SoundDeviceSpeakerOutput(AudioOutputInterface): # Renamed class
                              audio_float32 = audio_float32.reshape(-1, self._channels)
                         # -------------------------------------------------------
 
-                        # Run blocking write in executor with the float32 data
-                        chunk_len = len(audio_float32) # Get number of samples for logging
-                        # self.logger.debug(f"Playback worker: Attempting to write {chunk_len} float32 samples to stream...")
                         await self._loop.run_in_executor(None, self._stream.write, audio_float32)
                         # self.logger.debug(f"Playback worker: Successfully wrote {chunk_len} float32 samples to stream.")
                     except sd.PortAudioError as e:
