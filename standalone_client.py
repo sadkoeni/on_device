@@ -63,6 +63,7 @@ class TriggerEvent(enum.Enum):
 ASSISTANT_IDENTITY = os.getenv("ASSISTANT_IDENTITY", "assistant")
 ASSISTANT_ROOM_NAME = os.getenv("LIVEKIT_ROOM_NAME", "lightberry")
 DEVICE_ID = os.getenv("DEVICE_ID", "rechavpPa8YyWv7Zn")
+EXPECTED_ASSISTANT_IDENTITY = f"agent-{DEVICE_ID}"
 #LIVEKIT_ROOM_NAME="lightberry"
 LIVEKIT_URL="wss://lb-ub8o0q4v.livekit.cloud"
 TIMING_LOG_DIR="timing_logs"
@@ -1928,7 +1929,7 @@ class LightberryLocalClient:
 
     def _on_track_subscribed(self, track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant):
         self.logger.info(f"Track subscribed: {track.kind} '{track.name}' from {participant.identity}")
-        if track.kind == rtc.TrackKind.KIND_AUDIO and participant.identity == ASSISTANT_IDENTITY:
+        if track.kind == rtc.TrackKind.KIND_AUDIO and (participant.identity == ASSISTANT_IDENTITY or participant.identity == EXPECTED_ASSISTANT_IDENTITY):
             if track.sid not in self._playback_tasks or self._playback_tasks[track.sid].done():
                 self.logger.info(f"Assistant audio track ({track.sid}) detected. Starting playback task.")
                 task = asyncio.create_task(self._forward_livekit_to_speaker(track), name=f"Playback_{track.sid[:6]}")
