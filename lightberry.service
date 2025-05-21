@@ -1,6 +1,17 @@
+# /etc/systemd/system/lightberry.service.d/override.conf
 [Unit]
+After=network.target sound.target      
+Requires=sound.target                   
 Description=Lightberry Standalone Client Service
-After=network.target # Or potentially network-online.target if it needs network immediately
+
+[Service]
+User=lightberrydev
+Group=audio
+# Point the service at the user’s runtime + Pulse/PipeWire socket
+Environment="XDG_RUNTIME_DIR=/run/user/1000"
+Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus"
+Environment="PULSE_SERVER=unix:/run/user/1000/pulse/native"
+
 
 [Service]
 User=root

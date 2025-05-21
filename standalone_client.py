@@ -81,13 +81,13 @@ DOUBLE_PRESS_TIMEOUT = 0.5 # Seconds to detect double press
 # --- End Trigger Configuration ---
 
 # --- ElevenLabs Configuration ---
-FALLBACK_API_KEY = "sk_cd7b19b436bf52c49f5c0b965ad3352e26ccefb6f188682d" # Placeholder for fallback
+FALLBACK_API_KEY = "sk_2f5964354fcc33fcf02f94ff257f56d8a57f2bfe6716549e" # Placeholder for fallback
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", FALLBACK_API_KEY)
 
 logger = logging.getLogger("LightberryLocalClient")
 logger.info(f"Using standard audio sample rate: {LIVEKIT_SAMPLE_RATE}Hz") # Use standard rate
 # set logger level to info
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.WARNING)
 
 if ELEVENLABS_API_KEY == FALLBACK_API_KEY:
     logger.warning(f"ELEVENLABS_API_KEY not set in environment. Using placeholder fallback key: '{FALLBACK_API_KEY}'. Wake phrase playback will likely fail unless this is replaced.")
@@ -113,7 +113,7 @@ async def get_credentials(device_id: str, username: str) -> tuple[Optional[str],
     fallback_room_name = "lightberry"
     fallback_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoiTGlnaHRiZXJyeSBBc3Npc3RhbnQiLCJ2aWRlbyI6eyJyb29tSm9pbiI6dHJ1ZSwicm9vbSI6ImxpZ2h0YmVycnkiLCJjYW5QdWJsaXNoIjp0cnVlLCJjYW5TdWJzY3JpYmUiOnRydWUsImNhblB1Ymxpc2hEYXRhIjp0cnVlfSwic3ViIjoidGVzdGVyIiwiaXNzIjoiQVBJM0VucVFRbTNqZEFYIiwibmJmIjoxNzQ1Nzg4NTY5LCJleHAiOjE3NDU4MTAxNjl9.JDMdxWZ6Qb6X3H_gCFsHfVJOItgAL0q6EWYp1zv6uO8"
     fallback_wake_phrase = "Hello Sir."  # Default wake phrase
-    fallback_voice_id = "NNl6r8mD7vthiJatiJt1"  # Default voice ID (Bradford)
+    fallback_voice_id = "C8wZRioDZqA6fkwDW6Df"  # Default voice ID (Bradford)
     # ---------------------------------
 
     try:
@@ -1036,7 +1036,7 @@ async def stream_wake_phrase(
     source_format = "pcm_24000" # Request 24kHz PCM from ElevenLabs
     source_rate = 24000
 
-    ws_url = f"wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input?model_id=eleven_multilingual_v2&output_format={source_format}"
+    ws_url = f"wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input?output_format={source_format}"
 
     wsapp: Optional[websocket.WebSocketApp] = None
     ws_thread: Optional[threading.Thread] = None
