@@ -11,10 +11,6 @@ Group=audio
 Environment="XDG_RUNTIME_DIR=/run/user/1000"
 Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus"
 Environment="PULSE_SERVER=unix:/run/user/1000/pulse/native"
-
-
-[Service]
-User=root
 WorkingDirectory=/home/lightberrydev/lb
 ExecStart=/home/lightberrydev/lb/venv/bin/python /home/lightberrydev/lb/standalone_client.py
 Restart=on-failure
