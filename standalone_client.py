@@ -44,6 +44,11 @@ from interfaces import AudioInputInterface, AudioOutputInterface, IOHandlerInter
 
 from constants import LIVEKIT_SAMPLE_RATE, PYAUDIO_CHUNK_SIZE, PYAUDIO_CHANNELS, PYAUDIO_FORMAT, LIVEKIT_CHANNELS
 
+# --- Audio timeout constants for Bluetooth compatibility ---
+AUDIO_QUEUE_TIMEOUT_S = 2.0  # Timeout for putting audio chunks into queues
+BLUETOOTH_SPEAKER_TIMEOUT_S = 3.0  # Timeout for SoundDevice speaker operations
+# --- End audio timeout constants ---
+
 # --- Enums for State Machine and Triggers ---
 class AppState(enum.Enum):
     IDLE = 1
@@ -613,8 +618,8 @@ class LocalIOHandler:
 
         # Create internal queues
         self._wakeword_audio_queue = queue.Queue(maxsize=50) # Standard queue for WakeWord thread
-        self._livekit_input_queue = asyncio.Queue(maxsize=200) # Async queue for Client coroutine
-        self._speaker_output_queue = asyncio.Queue(maxsize=200) # Async queue for output transfer coroutine
+        self._livekit_input_queue = asyncio.Queue(maxsize=1000) # Async queue for Client coroutine
+        self._speaker_output_queue = asyncio.Queue(maxsize=1000) # Async queue for output transfer coroutine
 
         # Create internal events
         self._stop_event = asyncio.Event() # Global stop for internal loops
@@ -681,9 +686,9 @@ class LocalIOHandler:
             self.logger.debug("Handler stopping, discarding audio chunk for playback.")
             return
         try:
-            await asyncio.wait_for(self._speaker_output_queue.put(chunk), timeout=0.2)
+            await asyncio.wait_for(self._speaker_output_queue.put(chunk), timeout=AUDIO_QUEUE_TIMEOUT_S)
         except asyncio.TimeoutError:
-             self.logger.warning("Timeout putting chunk into speaker output queue.")
+             self.logger.warning(f"Timeout ({AUDIO_QUEUE_TIMEOUT_S}s) putting chunk into speaker output queue.")
         except asyncio.QueueFull:
              self.logger.warning("Speaker output queue full, dropping chunk.")
         except Exception as e:
@@ -1368,7 +1373,7 @@ class SoundDeviceSpeakerOutput(AudioOutputInterface): # Renamed class
         self._stream: Optional[sd.OutputStream] = None # Changed stream type
         self._sample_rate = sample_rate
         self._channels = channels
-        self._audio_queue = asyncio.Queue(maxsize=100) # Buffer size
+        self._audio_queue = asyncio.Queue(maxsize=1000) # Buffer size
         self._playback_task: Optional[asyncio.Task] = None
         self._is_speaking = False
         self._is_running = False # Add state tracking
@@ -1502,11 +1507,11 @@ class SoundDeviceSpeakerOutput(AudioOutputInterface): # Renamed class
         if self._is_running and self._playback_task and not self._playback_task.done():
             try:
                 # Use put_nowait or bounded wait if queue full is critical
-                await asyncio.wait_for(self._audio_queue.put(chunk), timeout=0.1)
+                await asyncio.wait_for(self._audio_queue.put(chunk), timeout=BLUETOOTH_SPEAKER_TIMEOUT_S)
             except asyncio.QueueFull:
                  self.logger.warning("Sounddevice output queue full, dropping chunk.")
             except asyncio.TimeoutError:
-                 self.logger.warning("Timeout putting chunk into Sounddevice output queue.")
+                 self.logger.warning(f"Timeout ({BLUETOOTH_SPEAKER_TIMEOUT_S}s) putting chunk into Sounddevice output queue.")
             except Exception as e:
                 self.logger.error(f"Error sending audio chunk: {e}", exc_info=True)
         elif not self._is_running:
