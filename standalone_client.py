@@ -23,6 +23,7 @@ from openwakeword.model import Model
 import websocket # Added for ElevenLabs WS
 import base64 # Added for ElevenLabs WS audio decoding
 import collections # Added for circular buffer
+import soundfile as sf # Added for reading WAV files
 
 from livekit import rtc
 from livekit import api
@@ -57,6 +58,7 @@ class TriggerEvent(enum.Enum):
     DOUBLE_PRESS = 3
     AUTO_PAUSE = 4
     UNEXPECTED_DISCONNECT = 5 # New event for disconnects
+    ASSISTANT_ACTIVITY_TIMEOUT = 6 # New event for assistant inactivity
 # --- End Enums ---
 
 
@@ -335,8 +337,8 @@ class WakeWordTrigger(TriggerController):
                  loop: asyncio.AbstractEventLoop,
                  event_queue: asyncio.Queue,
                  io_handler: 'LocalIOHandler', # Reference to the IO Handler
-                 activation_word: str = "Hi_Bradford",        # Changed default activation word
-                 stop_word: str = "lightberry_restart",    # Changed default stop word
+                 activation_word: str = "Hi_Ga_nesh",        # Changed default activation word
+                 stop_word: str = "go_to_sleep",    # Changed default stop word
                  threshold: float = 0.5):
         super().__init__(loop, event_queue)
         self.io_handler = io_handler
@@ -367,8 +369,8 @@ class WakeWordTrigger(TriggerController):
             # Use ONNX framework and specify only the required models by path
             inference_framework = 'onnx'
             custom_model_paths = [
-                f"wakeword_models/Hi_Bradford.{inference_framework}", 
-                f"wakeword_models/lightberry_restart.{inference_framework}"
+                f"wakeword_models/Hi_Ga_nesh.{inference_framework}", 
+                f"wakeword_models/go_to_sleep.{inference_framework}"
             ]
             self.oww_model = Model(
                 wakeword_models=custom_model_paths,
@@ -580,6 +582,8 @@ class LocalIOHandler:
     # Debug toggle to disable silence detection completely
     DISABLE_SILENCE_DETECTION = False  # Set to True to send all frames to wake word detector
 
+    ASSISTANT_INACTIVITY_TIMEOUT_S = 40.0 # Timeout for assistant inactivity
+
     def __init__(self,
                  loop: asyncio.AbstractEventLoop,
                  logger_instance: Optional[logging.Logger] = None,
@@ -632,6 +636,7 @@ class LocalIOHandler:
         self._frames_skipped = 0              # Count for debug stats
         # Create circular buffer for pre-speech frames (stores recent silent frames)
         self._pre_speech_buffer = collections.deque(maxlen=self.PRE_SPEECH_BUFFER_SIZE)
+        self._activity_timeout_task: Optional[asyncio.Task] = None # Task for assistant inactivity timer
         
         try:
             # Attempt to get the event from the owned output component
@@ -687,6 +692,7 @@ class LocalIOHandler:
     async def signal_client_disconnected(self):
         """Called by the client when it is disconnecting."""
         self.logger.info("Client disconnected signal received. Disabling LiveKit input path.")
+        self._cancel_inactivity_timer() # Cancel timer on client disconnect
         await self.disable_livekit_input() # Use new method
 
     async def enable_livekit_input(self):
@@ -695,6 +701,8 @@ class LocalIOHandler:
             self.logger.info("Enabling LiveKit input path.")
             await self._empty_queue(self._livekit_input_queue) # Clear stale data
             self._livekit_input_enabled = True
+        # Always (re)start timer if assistant is not speaking when input becomes active
+        self._start_inactivity_timer()
 
     async def disable_livekit_input(self):
         """Disable forwarding of microphone input to the LiveKit queue."""
@@ -702,6 +710,8 @@ class LocalIOHandler:
             self.logger.info("Disabling LiveKit input path.")
             self._livekit_input_enabled = False
             await self._empty_queue(self._livekit_input_queue) # Clear queue
+        # (Re)start timer if assistant is not speaking when input is paused (still in active session)
+        self._start_inactivity_timer()
 
     # --- Lifecycle Management (Called by main) ---
     async def start(self):
@@ -756,6 +766,7 @@ class LocalIOHandler:
              try: await asyncio.wait_for(asyncio.gather(*component_stop_tasks, return_exceptions=True), timeout=5.0)
              except asyncio.TimeoutError: self.logger.warning("Timeout stopping underlying audio components.")
              except Exception as e: self.logger.error(f"Error stopping underlying audio components: {e}")
+        self._cancel_inactivity_timer() # Cancel timer when handler itself is stopping
         self.logger.info("LocalIOHandler stopped.")
 
     # --- Internal Processing Loops ---
@@ -942,6 +953,7 @@ class LocalIOHandler:
                         # Transition: Silence -> Speech
                         self.logger.debug(f"Output VAD: Start of speech detected (Energy: {energy:.2f}).")
                         self._assistant_speaking = True
+                        self._cancel_inactivity_timer() # Assistant started speaking, cancel timer
                         await self.audio_output.signal_start_of_speech()
                         # NO LONGER directly pauses input paths here
                 else: # Currently silent chunk
@@ -955,6 +967,7 @@ class LocalIOHandler:
                             await self.audio_output.signal_end_of_speech()
                             await self._wait_for_output_completion() 
                             self._assistant_speaking = False # <<< Only change this flag
+                            self._start_inactivity_timer() # Assistant stopped speaking, start timer
                             # --- End Trigger End of Speech --- 
                     pass # Do nothing
                 # --- End Manage _assistant_speaking flag --- 
@@ -974,6 +987,7 @@ class LocalIOHandler:
                      self._consecutive_silence_count = 0 
                      await self.audio_output.signal_end_of_speech()
                      await self._wait_for_output_completion()
+                     self._start_inactivity_timer() # Assistant stopped speaking (timeout), start timer
                  continue # Continue loop after timeout
         self.logger.info("Output transfer loop finished.")
 
@@ -1011,6 +1025,119 @@ class LocalIOHandler:
             else: self.logger.warning(f"_empty_queue called with unknown queue type: {type(q)}")
         except Exception as e: self.logger.error(f"Error emptying queue {q}: {e}", exc_info=True)
         if emptied_count > 0: self.logger.debug(f"Emptied {emptied_count} items from queue.")
+
+    # --- Assistant Inactivity Timer Methods ---
+    def _start_inactivity_timer(self):
+        self._cancel_inactivity_timer() # Cancel any existing one first
+        if not self._assistant_speaking: # Only start if assistant is not currently speaking
+            self.logger.debug(f"Starting assistant inactivity timer for {self.ASSISTANT_INACTIVITY_TIMEOUT_S}s.")
+            self._activity_timeout_task = self._loop.create_task(self._assistant_inactivity_monitor())
+        else:
+            self.logger.debug("Assistant is currently speaking; inactivity timer not started.")
+
+    def _cancel_inactivity_timer(self):
+        if self._activity_timeout_task and not self._activity_timeout_task.done():
+            self.logger.debug("Cancelling assistant inactivity timer task.")
+            self._activity_timeout_task.cancel()
+        self._activity_timeout_task = None
+
+    async def _assistant_inactivity_monitor(self):
+        try:
+            await asyncio.sleep(self.ASSISTANT_INACTIVITY_TIMEOUT_S)
+            # If we reach here, the sleep completed without cancellation
+            if self._trigger_event_queue: # Check if queue exists
+                self.logger.info(f"Assistant inactivity timeout of {self.ASSISTANT_INACTIVITY_TIMEOUT_S}s reached. Emitting ASSISTANT_ACTIVITY_TIMEOUT event.")
+                try:
+                    # Ensure we are in a context that can put to asyncio.Queue
+                    if self._loop.is_running(): # Check if loop is running
+                         self._trigger_event_queue.put_nowait(TriggerEvent.ASSISTANT_ACTIVITY_TIMEOUT)
+                    else:
+                        self.logger.warning("Event loop not running, cannot put ASSISTANT_ACTIVITY_TIMEOUT.")
+                except asyncio.QueueFull:
+                    self.logger.warning("Trigger event queue full, ASSISTANT_ACTIVITY_TIMEOUT event might be lost.")
+                except Exception as e:
+                    self.logger.error(f"Error putting ASSISTANT_ACTIVITY_TIMEOUT to queue: {e}", exc_info=True)
+            else:
+                self.logger.warning("Trigger event queue not available, cannot emit ASSISTANT_ACTIVITY_TIMEOUT.")
+        except asyncio.CancelledError:
+            self.logger.debug("Assistant inactivity monitor task was cancelled.")
+        except Exception as e:
+            self.logger.error(f"Error in assistant inactivity monitor: {e}", exc_info=True)
+        finally:
+            # Clear the task reference if this task instance is the one currently stored
+            # and it's finishing (either normally, by error, or cancellation handled by _cancel method)
+            if self._activity_timeout_task is asyncio.current_task():
+                self._activity_timeout_task = None
+    # --- End Assistant Inactivity Timer Methods ---
+
+    # --- Local WAV Playback Method ---
+    async def play_local_wav_file(self, file_path: str):
+        """Plays a local WAV file through the speaker output."""
+        self.logger.info(f"Attempting to play local WAV file: {file_path}")
+        if not os.path.exists(file_path):
+            self.logger.error(f"Local WAV file not found: {file_path}")
+            return
+
+        try:
+            # Read WAV file
+            audio_data, source_rate = sf.read(file_path, dtype='int16', always_2d=False)
+
+            if audio_data.ndim > 1 and audio_data.shape[1] > 1:
+                self.logger.debug(f"WAV is stereo ({audio_data.shape[1]} channels), converting to mono.")
+                audio_data = np.mean(audio_data, axis=1).astype(np.int16)
+            elif audio_data.ndim > 1 and audio_data.shape[1] == 1:
+                audio_data = audio_data[:,0]
+
+            if audio_data.dtype != np.int16:
+                self.logger.warning(f"WAV data type is {audio_data.dtype}, attempting conversion to int16.")
+                if np.issubdtype(audio_data.dtype, np.floating):
+                    audio_data = (audio_data * 32767).astype(np.int16)
+                else:
+                    self.logger.error("Unsupported WAV data type for direct conversion to int16.")
+                    return
+
+            raw_audio_bytes = audio_data.tobytes()
+
+            if source_rate != TARGET_SAMPLE_RATE:
+                self.logger.info(f"Resampling WAV from {source_rate}Hz to {TARGET_SAMPLE_RATE}Hz.")
+                resampled_bytes = await resample_audio_chunk(raw_audio_bytes, source_rate, TARGET_SAMPLE_RATE, self.logger)
+                if not resampled_bytes:
+                    self.logger.error("Resampling local WAV file failed.")
+                    return
+                final_audio_bytes = resampled_bytes
+            else:
+                final_audio_bytes = raw_audio_bytes
+
+            if not final_audio_bytes:
+                self.logger.error("Final audio bytes for local WAV are empty.")
+                return
+
+            chunk_duration_ms = 10
+            bytes_per_sample = 2 # for int16
+            num_channels = 1 # Mono
+            chunk_size_bytes = (TARGET_SAMPLE_RATE // (1000 // chunk_duration_ms)) * bytes_per_sample * num_channels
+            self.logger.debug(f"Playing WAV: Total bytes {len(final_audio_bytes)}, chunk size {chunk_size_bytes} bytes.")
+
+            if hasattr(self.audio_output, 'signal_start_of_speech'):
+                 await self.audio_output.signal_start_of_speech()
+
+            for i in range(0, len(final_audio_bytes), chunk_size_bytes):
+                chunk = final_audio_bytes[i:i + chunk_size_bytes]
+                if not chunk: break
+                await self.play_audio_chunk(chunk)
+                await asyncio.sleep(float(len(chunk)) / (TARGET_SAMPLE_RATE * bytes_per_sample * num_channels) * 0.8)
+
+            if hasattr(self.audio_output, 'signal_end_of_speech'):
+                await self.audio_output.signal_end_of_speech()
+
+            await self._wait_for_output_completion()
+            self.logger.info(f"Finished playing local WAV file: {file_path}")
+
+        except sf.LibsndfileError as e:
+            self.logger.error(f"Soundfile error reading WAV {file_path}: {e}")
+        except Exception as e:
+            self.logger.error(f"Error playing local WAV file {file_path}: {e}", exc_info=True)
+    # --- End Local WAV Playback Method ---
 
 
 # --- ElevenLabs WebSocket TTS --- 
@@ -1224,6 +1351,7 @@ async def stream_wake_phrase(
                 effective_logger.warning("Wake phrase TTS WebSocket thread did not exit cleanly.")
         effective_logger.debug("Wake phrase TTS cleanup complete.")
 # --- End ElevenLabs WebSocket TTS ---
+
 
 # --- SoundDevice Class (Unchanged) ---
 class SoundDeviceSpeakerOutput(AudioOutputInterface): # Renamed class
@@ -2008,6 +2136,7 @@ async def main():
     stop_event = asyncio.Event() # Global stop signal for main loop only
     current_state = AppState.IDLE
     client: Optional[LightberryLocalClient] = None
+    first_idle_entry = True # Flag to track the first entry into IDLE state
 
     # --- Persistent Components --- #
     persistent_io_handler: Optional[LocalIOHandler] = None
@@ -2077,6 +2206,13 @@ async def main():
 
     # --- Main State Machine Loop ---
     try:
+        # Declare first_idle_entry as nonlocal here if it's modified within the loop
+        # However, since first_idle_entry is defined in the same scope as the while loop,
+        # nonlocal is not strictly needed here unless main itself was nested further.
+        # The linter might be overly cautious. Let's ensure correct scoping for modification.
+        # For simplicity and directness, we ensure it's part of the main's direct scope.
+        # The issue was likely the placement of the nonlocal keyword inside the if block.
+
         while not stop_event.is_set():
             logger.debug(f"--- Main Loop: Current State = {current_state.name} ---")
 
@@ -2091,6 +2227,13 @@ async def main():
                 try:
                     logger.info("Ensuring persistent IO handler is started...")
                     await persistent_io_handler.start()
+                    # Play startup sound only on the first entry to IDLE
+                    # nonlocal first_idle_entry # This was the problematic placement
+                    if first_idle_entry:
+                        logger.info("Playing startup sound (first IDLE entry)...")
+                        await persistent_io_handler.play_local_wav_file("soft_gong_short.wav")
+                        first_idle_entry = False # Reset flag after playing
+
                     logger.info("Starting all available trigger listeners...")
                     if ww_trigger:
                         logger.debug("Starting WakeWordTrigger listener...")
@@ -2194,6 +2337,10 @@ async def main():
                     elif event == TriggerEvent.UNEXPECTED_DISCONNECT:
                         logger.warning("Unexpected disconnect event received. Stopping client.")
                         current_state = AppState.STOPPING
+                    elif event == TriggerEvent.ASSISTANT_ACTIVITY_TIMEOUT:
+                        logger.info("Assistant activity timeout. Stopping client and returning to IDLE.")
+                        print("Assistant timed out. Returning to IDLE...", flush=True)
+                        current_state = AppState.STOPPING
                     else: logger.warning(f"Unexpected event '{event.name}' in ACTIVE state.")
                 except asyncio.CancelledError: logger.info("ACTIVE state wait cancelled."); stop_event.set()
                 except Exception as e: logger.error(f"Error in ACTIVE state: {e}", exc_info=True); current_state = AppState.STOPPING
@@ -2216,6 +2363,10 @@ async def main():
                         current_state = AppState.STOPPING
                     elif event == TriggerEvent.UNEXPECTED_DISCONNECT:
                         logger.warning("Unexpected disconnect event while PAUSED. Stopping client.")
+                        current_state = AppState.STOPPING
+                    elif event == TriggerEvent.ASSISTANT_ACTIVITY_TIMEOUT:
+                        logger.info("Assistant activity timeout while PAUSED. Stopping client and returning to IDLE.")
+                        print("Assistant timed out. Returning to IDLE...", flush=True)
                         current_state = AppState.STOPPING
                     elif event == TriggerEvent.AUTO_PAUSE: logger.debug("Ignoring AUTO_PAUSE while PAUSED.")
                     else: logger.warning(f"Unexpected event '{event.name}' in PAUSED state.")
@@ -2247,20 +2398,29 @@ async def main():
         if current_state != AppState.STOPPING:
             logger.warning(f"Main loop exited unexpectedly from state {current_state.name}. Forcing STOPPING.")
 
-        async def _perform_final_cleanup(client_instance, trigger_controller_instance):
+        async def _perform_final_cleanup(client_instance, trigger_controller_instance, io_handler_instance):
             if client_instance:
                 logger.info("Performing final client stop...")
                 try:
-                    await client_instance.stop()
+                    await client_instance.stop() # This will call io_handler.signal_client_disconnected -> _cancel_inactivity_timer
                 except asyncio.TimeoutError:
                     logger.error("Client stop timed out during final cleanup.")
                 except Exception as e:
                     logger.error(f"Error during final client stop: {e}", exc_info=True)
+            
+            # Explicitly stop IO Handler and its timer if not done through client stop
+            if io_handler_instance:
+                logger.info("Performing final IO Handler stop (ensures timer cancellation)...")
+                try:
+                    await io_handler_instance.stop() # This calls _cancel_inactivity_timer
+                except Exception as e:
+                    logger.error(f"Error during final IO Handler stop: {e}", exc_info=True)
+
             if trigger_controller_instance:
                 logger.info("Performing final trigger listener stop...")
                 try:
                     trigger_controller_instance.stop_listening()
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.5) # Allow listeners to close
                 except Exception as e:
                     logger.error(f"Error during final trigger stop: {e}")
             logger.info("Final cleanup steps completed (within timeout check).")
@@ -2268,7 +2428,7 @@ async def main():
         shutdown_timeout = 10.0
         try:
             logger.info(f"Attempting graceful shutdown (timeout: {shutdown_timeout}s)...")
-            await asyncio.wait_for(_perform_final_cleanup(client, active_trigger_controller), timeout=shutdown_timeout)
+            await asyncio.wait_for(_perform_final_cleanup(client, active_trigger_controller, persistent_io_handler), timeout=shutdown_timeout)
             logger.info("Graceful shutdown completed or timed out okay.")
         except asyncio.TimeoutError:
             logger.error(f"Graceful shutdown timed out after {shutdown_timeout}s. Forcing exit.")
