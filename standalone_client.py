@@ -2267,6 +2267,8 @@ async def main():
                     if event == TriggerEvent.FIRST_PRESS:
                         logger.info("Activation trigger received. Transitioning to CONNECTING.")
                         print("Trigger received! Connecting...", flush=True)
+                        # Play activation gong asynchronously (fire-and-forget)
+                        asyncio.create_task(persistent_io_handler.play_local_wav_file("soft_gong_short.wav"))
                         current_state = AppState.CONNECTING
                     elif event == TriggerEvent.UNEXPECTED_DISCONNECT:
                         logger.warning("Received UNEXPECTED_DISCONNECT in IDLE state. Ignoring.")
