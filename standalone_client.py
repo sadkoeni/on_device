@@ -88,7 +88,7 @@ DOUBLE_PRESS_TIMEOUT = 0.5 # Seconds to detect double press
 # --- End Trigger Configuration ---
 
 # --- ElevenLabs Configuration ---
-FALLBACK_API_KEY = "sk_2f5964354fcc33fcf02f94ff257f56d8a57f2bfe6716549e" # Placeholder for fallback
+FALLBACK_API_KEY = "None" # Placeholder for fallback
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", FALLBACK_API_KEY)
 
 logger = logging.getLogger("LightberryLocalClient")
