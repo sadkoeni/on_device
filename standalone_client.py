@@ -1373,7 +1373,7 @@ class SoundDeviceSpeakerOutput(AudioOutputInterface): # Renamed class
         self._stream: Optional[sd.OutputStream] = None # Changed stream type
         self._sample_rate = sample_rate
         self._channels = channels
-        self._audio_queue = asyncio.Queue(maxsize=1000) # Buffer size
+        self._audio_queue = asyncio.Queue(maxsize=100) # Buffer size
         self._playback_task: Optional[asyncio.Task] = None
         self._is_speaking = False
         self._is_running = False # Add state tracking
