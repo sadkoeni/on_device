@@ -2062,7 +2062,7 @@ class LightberryLocalClient:
 
     def _on_track_subscribed(self, track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant):
         self.logger.info(f"Track subscribed: {track.kind} '{track.name}' from {participant.identity}")
-        if track.kind == rtc.TrackKind.KIND_AUDIO and (participant.identity == ASSISTANT_IDENTITY or participant.identity == EXPECTED_ASSISTANT_IDENTITY):
+        if track.kind == rtc.TrackKind.KIND_AUDIO and (participant.identity == EXPECTED_ASSISTANT_IDENTITY):
             if track.sid not in self._playback_tasks or self._playback_tasks[track.sid].done():
                 self.logger.info(f"Assistant audio track ({track.sid}) detected. Starting playback task.")
                 task = asyncio.create_task(self._forward_livekit_to_speaker(track), name=f"Playback_{track.sid[:6]}")
