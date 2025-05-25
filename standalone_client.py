@@ -45,8 +45,8 @@ from interfaces import AudioInputInterface, AudioOutputInterface, IOHandlerInter
 from constants import LIVEKIT_SAMPLE_RATE, PYAUDIO_CHUNK_SIZE, PYAUDIO_CHANNELS, PYAUDIO_FORMAT, LIVEKIT_CHANNELS
 
 # --- Audio timeout constants for Bluetooth compatibility ---
-AUDIO_QUEUE_TIMEOUT_S = 2.0  # Timeout for putting audio chunks into queues
-BLUETOOTH_SPEAKER_TIMEOUT_S = 3.0  # Timeout for SoundDevice speaker operations
+AUDIO_QUEUE_TIMEOUT_S = 0.2  # Timeout for putting audio chunks into queues
+BLUETOOTH_SPEAKER_TIMEOUT_S = 0.2  # Timeout for SoundDevice speaker operations
 # --- End audio timeout constants ---
 
 # --- Enums for State Machine and Triggers ---
@@ -618,8 +618,8 @@ class LocalIOHandler:
 
         # Create internal queues
         self._wakeword_audio_queue = queue.Queue(maxsize=50) # Standard queue for WakeWord thread
-        self._livekit_input_queue = asyncio.Queue(maxsize=1000) # Async queue for Client coroutine
-        self._speaker_output_queue = asyncio.Queue(maxsize=1000) # Async queue for output transfer coroutine
+        self._livekit_input_queue = asyncio.Queue(maxsize=200) # Async queue for Client coroutine
+        self._speaker_output_queue = asyncio.Queue(maxsize=200) # Async queue for output transfer coroutine
 
         # Create internal events
         self._stop_event = asyncio.Event() # Global stop for internal loops
