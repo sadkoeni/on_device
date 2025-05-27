@@ -1930,7 +1930,7 @@ class LightberryLocalClient:
         # Disconnect from room
         room_to_disconnect = self._room
         self._room = None
-        if room_to_disconnect and self._is_connected: # Check flag again before disconnect
+        if room_to_disconnect: # Should check flag again before disconnect, ideally with the was_connected flag. skipping for now. 
             self.logger.info("Disconnecting from LiveKit room...")
             try: await room_to_disconnect.disconnect()
             except Exception as e: self.logger.error(f"Error during room disconnect: {e}", exc_info=True)
