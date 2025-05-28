@@ -105,6 +105,9 @@ elif not ELEVENLABS_API_KEY: # Handles case where env var is set to an empty str
 # --- define wake and sleep sounds files ---
 WAKE_SOUND_FILE = "bradford-wake.wav"
 SLEEP_SOUND_FILE = "bradford-sleep.wav"
+
+WakeSoundData, WakeSoundRate = sf.read(WAKE_SOUND_FILE, dtype='int16', always_2d=False)
+SleepSoundData, SleepSoundRate = sf.read(SLEEP_SOUND_FILE, dtype='int16', always_2d=False)
 # --- end define wake and sleep sounds files ---
 
 AUTH_API_URL = "https://lightberry.vercel.app/api/authenticate/{}" # Placeholder for device ID
@@ -1183,7 +1186,68 @@ class LocalIOHandler:
         except Exception as e:
             self.logger.error(f"Error playing local WAV file {file_path}: {e}", exc_info=True)
     # --- End Local WAV Playback Method ---
+    async def play_preloaded_wav_file(self, audio_data: np.ndarray, source_rate: int):
 
+        try:
+            # Read WAV file
+            
+
+            if audio_data.ndim > 1 and audio_data.shape[1] > 1:
+                self.logger.debug(f"WAV is stereo ({audio_data.shape[1]} channels), converting to mono.")
+                audio_data = np.mean(audio_data, axis=1).astype(np.int16)
+            elif audio_data.ndim > 1 and audio_data.shape[1] == 1:
+                audio_data = audio_data[:,0]
+
+            if audio_data.dtype != np.int16:
+                self.logger.warning(f"WAV data type is {audio_data.dtype}, attempting conversion to int16.")
+                if np.issubdtype(audio_data.dtype, np.floating):
+                    audio_data = (audio_data * 32767).astype(np.int16)
+                else:
+                    self.logger.error("Unsupported WAV data type for direct conversion to int16.")
+                    return
+
+            raw_audio_bytes = audio_data.tobytes()
+
+            if source_rate != TARGET_SAMPLE_RATE:
+                self.logger.info(f"Resampling WAV from {source_rate}Hz to {TARGET_SAMPLE_RATE}Hz.")
+                resampled_bytes = await resample_audio_chunk(raw_audio_bytes, source_rate, TARGET_SAMPLE_RATE, self.logger)
+                if not resampled_bytes:
+                    self.logger.error("Resampling local WAV file failed.")
+                    return
+                final_audio_bytes = resampled_bytes
+            else:
+                final_audio_bytes = raw_audio_bytes
+
+            if not final_audio_bytes:
+                self.logger.error("Final audio bytes for local WAV are empty.")
+                return
+
+            chunk_duration_ms = 10
+            bytes_per_sample = 2 # for int16
+            num_channels = 1 # Mono
+            chunk_size_bytes = (TARGET_SAMPLE_RATE // (1000 // chunk_duration_ms)) * bytes_per_sample * num_channels
+            self.logger.debug(f"Playing WAV: Total bytes {len(final_audio_bytes)}, chunk size {chunk_size_bytes} bytes.")
+
+            if hasattr(self.audio_output, 'signal_start_of_speech'):
+                 await self.audio_output.signal_start_of_speech()
+
+            for i in range(0, len(final_audio_bytes), chunk_size_bytes):
+                chunk = final_audio_bytes[i:i + chunk_size_bytes]
+                if not chunk: break
+                await self.play_audio_chunk(chunk)
+                await asyncio.sleep(float(len(chunk)) / (TARGET_SAMPLE_RATE * bytes_per_sample * num_channels) * 0.8)
+
+            if hasattr(self.audio_output, 'signal_end_of_speech'):
+                await self.audio_output.signal_end_of_speech()
+
+            await self._wait_for_output_completion()
+            self.logger.info(f"Finished playing local WAV file: {file_path}")
+
+        except sf.LibsndfileError as e:
+            self.logger.error(f"Soundfile error reading WAV {file_path}: {e}")
+        except Exception as e:
+            self.logger.error(f"Error playing local WAV file {file_path}: {e}", exc_info=True)
+    # --- End Local WAV Playback Method ---
 
 # --- ElevenLabs WebSocket TTS --- 
 async def stream_wake_phrase(
@@ -2308,7 +2372,7 @@ async def main():
                         logger.info("Activation trigger received. Transitioning to CONNECTING.")
                         print("Trigger received! Connecting...", flush=True)
                         # Play activation gong asynchronously (fire-and-forget)
-                        asyncio.create_task(persistent_io_handler.play_local_wav_file(WAKE_SOUND_FILE))
+                        asyncio.create_task(persistent_io_handler.play_preloaded_wav_file(WakeSoundData, WakeSoundRate))
                         current_state = AppState.CONNECTING
                     elif event == TriggerEvent.UNEXPECTED_DISCONNECT:
                         logger.warning("Unexpected disconnect event received. Stopping client.")
@@ -2434,7 +2498,7 @@ async def main():
             elif current_state == AppState.STOPPING:
                 print(">>> Current State: STOPPING <<<", flush=True)
                 logger.info("Entered STOPPING state (stopping client only).")
-                asyncio.create_task(persistent_io_handler.play_local_wav_file(SLEEP_SOUND_FILE))
+                asyncio.create_task(persistent_io_handler.play_preloaded_wav_file(SleepSoundData, SleepSoundRate))
                 if client:
                     logger.info("Stopping Lightberry client...")
                     try: await client.stop()
