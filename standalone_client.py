@@ -2378,7 +2378,7 @@ async def main():
                         logger.info("Activation trigger received. Transitioning to CONNECTING.")
                         print("Trigger received! Connecting...", flush=True)
                         # Play activation gong asynchronously (fire-and-forget)
-                        await persistent_io_handler.play_preloaded_wav_file(WakeSoundData, WakeSoundRate)
+                        play_wav_background(WAKE_SOUND_FILE)
                         current_state = AppState.CONNECTING
                     elif event == TriggerEvent.UNEXPECTED_DISCONNECT:
                         logger.warning("Unexpected disconnect event received. Stopping client.")
@@ -2504,7 +2504,7 @@ async def main():
             elif current_state == AppState.STOPPING:
                 print(">>> Current State: STOPPING <<<", flush=True)
                 logger.info("Entered STOPPING state (stopping client only).")
-                asyncio.create_task(persistent_io_handler.play_preloaded_wav_file(SleepSoundData, SleepSoundRate))
+                play_wav_background(SLEEP_SOUND_FILE)
                 if client:
                     logger.info("Stopping Lightberry client...")
                     try: await client.stop()
