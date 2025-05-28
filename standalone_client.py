@@ -1075,6 +1075,42 @@ class LocalIOHandler:
                 self._activity_timeout_task = None
     # --- End Assistant Inactivity Timer Methods ---
 
+    def _debug_print_queue_states(self, context: str = ""):
+        """Debug method to print the state of all audio queues in the speaker output pipeline."""
+        try:
+            # Get speaker output queue size
+            speaker_queue_size = self._speaker_output_queue.qsize()
+            speaker_queue_maxsize = self._speaker_output_queue.maxsize
+            
+            # Get audio output internal queue size if available
+            audio_output_queue_size = "N/A"
+            audio_output_queue_maxsize = "N/A"
+            if hasattr(self.audio_output, '_audio_queue'):
+                audio_output_queue_size = self.audio_output._audio_queue.qsize()
+                audio_output_queue_maxsize = self.audio_output._audio_queue.maxsize
+            
+            # Get LiveKit input queue size for completeness
+            livekit_input_queue_size = self._livekit_input_queue.qsize()
+            livekit_input_queue_maxsize = self._livekit_input_queue.maxsize
+            
+            # Get wakeword queue size
+            wakeword_queue_size = self._wakeword_audio_queue.qsize()
+            wakeword_queue_maxsize = self._wakeword_audio_queue.maxsize
+            
+            print(f"\n=== 🔊 AUDIO QUEUE STATUS {context} ===")
+            print(f"📤 Speaker Output Queue:     {speaker_queue_size:3d}/{speaker_queue_maxsize} ({(speaker_queue_size/speaker_queue_maxsize*100):5.1f}% full)")
+            print(f"🔉 Audio Device Queue:       {audio_output_queue_size:>3}/{audio_output_queue_maxsize}")
+            print(f"🎤 LiveKit Input Queue:      {livekit_input_queue_size:3d}/{livekit_input_queue_maxsize} ({(livekit_input_queue_size/livekit_input_queue_maxsize*100):5.1f}% full)")
+            print(f"👂 WakeWord Queue:           {wakeword_queue_size:3d}/{wakeword_queue_maxsize} ({(wakeword_queue_size/wakeword_queue_maxsize*100):5.1f}% full)")
+            print(f"🔄 Assistant Speaking:       {self._assistant_speaking}")
+            print(f"🎙️ LiveKit Input Enabled:    {self._livekit_input_enabled}")
+            print(f"=======================================\n")
+            
+        except Exception as e:
+            self.logger.error(f"Error in _debug_print_queue_states: {e}", exc_info=True)
+
+    # --- End Debug Methods ---
+
     # --- Local WAV Playback Method ---
     async def play_local_wav_file(self, file_path: str):
         """Plays a local WAV file through the speaker output."""
@@ -2062,7 +2098,7 @@ class LightberryLocalClient:
 
     def _on_track_subscribed(self, track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant):
         self.logger.info(f"Track subscribed: {track.kind} '{track.name}' from {participant.identity}")
-        if track.kind == rtc.TrackKind.KIND_AUDIO and (participant.identity == EXPECTED_ASSISTANT_IDENTITY):
+        if track.kind == rtc.TrackKind.KIND_AUDIO:# and (EXPECTED_ASSISTANT_IDENTITY in participant.identity):
             if track.sid not in self._playback_tasks or self._playback_tasks[track.sid].done():
                 self.logger.info(f"Assistant audio track ({track.sid}) detected. Starting playback task.")
                 task = asyncio.create_task(self._forward_livekit_to_speaker(track), name=f"Playback_{track.sid[:6]}")
@@ -2271,7 +2307,10 @@ async def main():
                         asyncio.create_task(persistent_io_handler.play_local_wav_file("soft_gong_short.wav"))
                         current_state = AppState.CONNECTING
                     elif event == TriggerEvent.UNEXPECTED_DISCONNECT:
-                        logger.warning("Received UNEXPECTED_DISCONNECT in IDLE state. Ignoring.")
+                        logger.warning("Unexpected disconnect event received. Stopping client.")
+                        # Print queue states on unexpected disconnect
+                        persistent_io_handler._debug_print_queue_states("(UNEXPECTED_DISCONNECT)")
+                        current_state = AppState.STOPPING
                     else:
                         logger.warning(f"Unexpected event '{event.name}' received in IDLE state. Ignoring.")
                 except asyncio.CancelledError: logger.info("IDLE state wait cancelled. Stopping application."); stop_event.set()
@@ -2282,6 +2321,8 @@ async def main():
             elif current_state == AppState.CONNECTING:
                 print(">>> Current State: CONNECTING <<<", flush=True)
                 logger.info("Entered CONNECTING state.")
+                # Print queue states at start of CONNECTING
+                persistent_io_handler._debug_print_queue_states("(Start of CONNECTING)")
                 token, room_name = None, None
                 try:
                     device_id = get_or_create_device_id()
@@ -2297,8 +2338,10 @@ async def main():
                         await client.start()
                         logger.info("Client started successfully.")
                         # --- Play Wake Phrase (WebSocket) ---
-                        await stream_wake_phrase(wake_phrase, voice_id, persistent_io_handler, logger_instance=logger) # <<< REPLACE OLD CALL WITH THIS
+                        # await stream_wake_phrase(wake_phrase, voice_id, persistent_io_handler, logger_instance=logger) # <<< REPLACE OLD CALL WITH THIS
                         # ----------------------------------
+                        # Print queue states before transitioning to ACTIVE
+                        persistent_io_handler._debug_print_queue_states("(Before ACTIVE transition)")
                         current_state = AppState.ACTIVE
                         await client.resume() # set livekit input path to enabled
                         logger.debug("Clearing trigger queue after activating client...")
@@ -2323,6 +2366,8 @@ async def main():
             elif current_state == AppState.ACTIVE:
                 print(">>> Current State: ACTIVE <<< Mic Live | Trigger: Pause/Stop", flush=True)
                 logger.info("Entered ACTIVE state. Waiting for trigger.")
+                # Print queue states at start of ACTIVE
+                persistent_io_handler._debug_print_queue_states("(Start of ACTIVE)")
                 try:
                     event = await trigger_event_queue.get()
                     logger.info(f"Event received in ACTIVE state: {event.name}")
@@ -2343,6 +2388,8 @@ async def main():
                         current_state = AppState.STOPPING
                     elif event == TriggerEvent.UNEXPECTED_DISCONNECT:
                         logger.warning("Unexpected disconnect event received. Stopping client.")
+                        # Print queue states on unexpected disconnect in ACTIVE state
+                        persistent_io_handler._debug_print_queue_states("(UNEXPECTED_DISCONNECT in ACTIVE)")
                         current_state = AppState.STOPPING
                     elif event == TriggerEvent.ASSISTANT_ACTIVITY_TIMEOUT:
                         logger.info("Assistant activity timeout. Stopping client and returning to IDLE.")
@@ -2390,7 +2437,7 @@ async def main():
                 client = None
                 logger.info("Transitioning back to IDLE state.")
                 current_state = AppState.IDLE
-                await asyncio.sleep(1)
+                await asyncio.sleep(.1)
 
             else:
                 logger.error(f"Reached unexpected state: {current_state}. Resetting to IDLE.")
