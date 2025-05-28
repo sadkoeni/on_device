@@ -1076,6 +1076,7 @@ class LocalIOHandler:
     # --- End Assistant Inactivity Timer Methods ---
 
     def _debug_print_queue_states(self, context: str = ""):
+        return # <<< DISABLED FOR NOW
         """Debug method to print the state of all audio queues in the speaker output pipeline."""
         try:
             # Get speaker output queue size
