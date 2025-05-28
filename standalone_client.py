@@ -102,7 +102,10 @@ elif not ELEVENLABS_API_KEY: # Handles case where env var is set to an empty str
     logger.warning("ELEVENLABS_API_KEY is set but empty. Wake phrase playback will fail.")
 # --- End ElevenLabs Configuration ---
 
-
+# --- define wake and sleep sounds files ---
+WAKE_SOUND_FILE = "bradford-wake.wav"
+SLEEP_SOUND_FILE = "bradford-sleep.wav"
+# --- end define wake and sleep sounds files ---
 
 AUTH_API_URL = "https://lightberry.vercel.app/api/authenticate/{}" # Placeholder for device ID
 
@@ -342,7 +345,7 @@ class WakeWordTrigger(TriggerController):
                  loop: asyncio.AbstractEventLoop,
                  event_queue: asyncio.Queue,
                  io_handler: 'LocalIOHandler', # Reference to the IO Handler
-                 activation_word: str = "Hi_Ga_nesh",        # Changed default activation word
+                 activation_word: str = "Hi_Bradford",        # Changed default activation word
                  stop_word: str = "go_to_sleep",    # Changed default stop word
                  threshold: float = 0.5):
         super().__init__(loop, event_queue)
@@ -374,7 +377,7 @@ class WakeWordTrigger(TriggerController):
             # Use ONNX framework and specify only the required models by path
             inference_framework = 'onnx'
             custom_model_paths = [
-                f"wakeword_models/Hi_Ga_nesh.{inference_framework}", 
+                f"wakeword_models/Hi_Bradford.{inference_framework}", 
                 f"wakeword_models/go_to_sleep.{inference_framework}"
             ]
             self.oww_model = Model(
@@ -2305,7 +2308,7 @@ async def main():
                         logger.info("Activation trigger received. Transitioning to CONNECTING.")
                         print("Trigger received! Connecting...", flush=True)
                         # Play activation gong asynchronously (fire-and-forget)
-                        asyncio.create_task(persistent_io_handler.play_local_wav_file("soft_gong_short.wav"))
+                        asyncio.create_task(persistent_io_handler.play_local_wav_file(WAKE_SOUND_FILE))
                         current_state = AppState.CONNECTING
                     elif event == TriggerEvent.UNEXPECTED_DISCONNECT:
                         logger.warning("Unexpected disconnect event received. Stopping client.")
@@ -2431,6 +2434,7 @@ async def main():
             elif current_state == AppState.STOPPING:
                 print(">>> Current State: STOPPING <<<", flush=True)
                 logger.info("Entered STOPPING state (stopping client only).")
+                asyncio.create_task(persistent_io_handler.play_local_wav_file(SLEEP_SOUND_FILE))
                 if client:
                     logger.info("Stopping Lightberry client...")
                     try: await client.stop()
