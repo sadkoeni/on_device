@@ -30,6 +30,12 @@ from livekit import api
 from dotenv import load_dotenv
 load_dotenv()
 
+import subprocess
+def play_wav_background(path):
+    subprocess.Popen([
+        "ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path
+    ])
+
 import asyncio
 import time
 import os
@@ -2372,7 +2378,7 @@ async def main():
                         logger.info("Activation trigger received. Transitioning to CONNECTING.")
                         print("Trigger received! Connecting...", flush=True)
                         # Play activation gong asynchronously (fire-and-forget)
-                        asyncio.create_task(persistent_io_handler.play_preloaded_wav_file(WakeSoundData, WakeSoundRate))
+                        await persistent_io_handler.play_preloaded_wav_file(WakeSoundData, WakeSoundRate)
                         current_state = AppState.CONNECTING
                     elif event == TriggerEvent.UNEXPECTED_DISCONNECT:
                         logger.warning("Unexpected disconnect event received. Stopping client.")
