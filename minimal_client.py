@@ -301,8 +301,9 @@ class ALSAAudioManager:
                 if self.assistant_speaking:
                     silence_chunks += 1
                 
-                # Yield CPU while idle.
-                time.sleep(0.01)
+                # Yield CPU while idle, but check back frequently.
+                # A 10ms sleep is too long and can introduce gaps.
+                time.sleep(0.001)
 
             # Unified End-of-Speech Check
             # Only consider ending speech if we have actually been speaking for a minimum duration.
