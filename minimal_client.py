@@ -22,6 +22,9 @@ import numpy as np
 import alsaaudio
 from livekit import rtc, api
 from openwakeword.model import Model
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
