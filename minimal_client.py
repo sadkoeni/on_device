@@ -77,13 +77,14 @@ class RingBuffer:
         # Atomic increment
         self.write_idx = (self.write_idx + 1) % self.size
         
-    def read(self) -> Optional[bytes]:
-        """Read oldest data"""
+    def read(self, peek: bool = False) -> Optional[bytes]:
+        """Read oldest data. If peek is True, don't advance read pointer."""
         if self.is_empty():
             return None
             
         data = bytes(self.buffer[self.read_idx])
-        self.read_idx = (self.read_idx + 1) % self.size
+        if not peek:
+            self.read_idx = (self.read_idx + 1) % self.size
         return data
         
     def read_last_n(self, n: int) -> List[bytes]:
@@ -255,40 +256,69 @@ class ALSAAudioManager:
             time.sleep(0.005)
 
     def _playback_loop(self) -> None:
-        """Dedicated thread for audio playback and hardware-aware VAD."""
+        """Dedicated thread for audio playback and hardware-aware VAD using a state machine."""
+        
+        class PlaybackState(Enum):
+            IDLE = 0
+            SPEAKING = 1
+            DRAINING = 2
+
+        state = PlaybackState.IDLE
+        silence_chunks = 0
+        
         while self.running:
-            if not self.speaker_buffer.is_empty():
-                chunk = self.speaker_buffer.read()
-                if chunk:
-                    try:
-                        # VAD to turn on the speaking flag. It is only turned off
-                        # when the hardware buffer is confirmed to be empty.
-                        if not self.assistant_speaking:
-                            energy = self._calculate_energy_fast(chunk)
-                            if energy > SILENCE_THRESHOLD:
-                                self.logger.debug("VAD: Speech started.")
-                                self.assistant_speaking = True
-                        
-                        self.speaker_pcm.write(chunk)
-                    except alsaaudio.ALSAAudioError as e:
-                        self.logger.error(f"Playback error: {e}")
-            else:
-                # The software buffer is empty. If we were speaking, that means
-                # the utterance has ended. Now, we must wait for the hardware buffer to drain.
-                if self.assistant_speaking:
-                    self.logger.debug("VAD: Software buffer empty. Draining hardware buffer...")
-                    try:
-                        # This is a blocking call that waits for the hardware buffer to be empty.
-                        self.speaker_pcm.drain()
-                        self.logger.debug("VAD: Hardware buffer drained. Speech has ended.")
-                    except alsaaudio.ALSAAudioError as e:
-                        self.logger.warning(f"VAD: pcm.drain() failed: {e}")
-                    finally:
-                        # Once the hardware is drained, we can safely re-enable the microphone.
-                        self.assistant_speaking = False
-                
-                # Sleep briefly to yield CPU while waiting for more audio.
-                time.sleep(0.01)
+            # Step 1: State Machine Logic
+            if state == PlaybackState.IDLE:
+                # In IDLE, we are waiting for the first audible chunk to start a "turn".
+                if not self.speaker_buffer.is_empty():
+                    chunk = self.speaker_buffer.read(peek=True) # Peek to check energy without consuming
+                    if chunk and self._calculate_energy_fast(chunk) > SILENCE_THRESHOLD:
+                        self.logger.debug("VAD: Speech detected. Transitioning to SPEAKING.")
+                        self.assistant_speaking = True
+                        state = PlaybackState.SPEAKING
+                        silence_chunks = 0
+                    else:
+                        # Consume the silent chunk to clear the buffer
+                        self.speaker_buffer.read()
+                else:
+                    # No audio in buffer, yield the CPU
+                    time.sleep(0.01)
+
+            elif state == PlaybackState.SPEAKING:
+                # In SPEAKING, we process all audio and watch for the end of the utterance.
+                if not self.speaker_buffer.is_empty():
+                    chunk = self.speaker_buffer.read()
+                    if not chunk: continue
+                    
+                    self.speaker_pcm.write(chunk)
+                    
+                    # Track silence to detect end of speech
+                    if self._calculate_energy_fast(chunk) > SILENCE_THRESHOLD:
+                        silence_chunks = 0
+                    else:
+                        silence_chunks += 1
+                    
+                    if silence_chunks > 25:  # ~250ms of silence marks the end of an utterance
+                        self.logger.debug("VAD: End of utterance detected by silence. Draining.")
+                        state = PlaybackState.DRAINING
+                else:
+                    # The buffer is momentarily empty, but the utterance might not be over.
+                    # We must wait for more data or for the silence counter to trip.
+                    time.sleep(0.01)
+
+            elif state == PlaybackState.DRAINING:
+                # In DRAINING, we wait for the hardware to finish playing everything.
+                self.logger.debug("VAD: Draining hardware buffer...")
+                try:
+                    self.speaker_pcm.drain()
+                    self.logger.debug("VAD: Hardware drained.")
+                except alsaaudio.ALSAAudioError as e:
+                    self.logger.warning(f"VAD: pcm.drain() failed: {e}")
+                finally:
+                    # This is the ONLY place the speaking flag is turned off.
+                    self.logger.debug("VAD: Speech ended. Returning to IDLE.")
+                    self.assistant_speaking = False
+                    state = PlaybackState.IDLE
 
     def _calculate_energy_fast(self, chunk: bytes) -> float:
         """Optimized energy calculation"""
