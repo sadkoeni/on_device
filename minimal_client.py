@@ -36,7 +36,7 @@ logger = logging.getLogger("Lightberry")
 # Constants
 SAMPLE_RATE = 48000
 CHANNELS = 1
-CHUNK_SIZE = 960  # 20ms at 48kHz
+CHUNK_SIZE = 960  # 10ms at 48kHz (480 frames * 2 bytes/frame)
 PERIOD_SIZE = 480  # 10ms periods
 SILENCE_THRESHOLD = 20
 LIVEKIT_URL = os.getenv("LIVEKIT_URL", "wss://lb-ub8o0q4v.livekit.cloud")
@@ -229,27 +229,23 @@ class ALSAAudioManager:
         await asyncio.sleep(duration)
     
     def _capture_loop(self) -> None:
-        """Dedicated thread for audio capture. It reads 5ms chunks from ALSA
+        """Dedicated thread for audio capture. It reads 10ms chunks from ALSA
         and assembles them into 10ms chunks for the ring buffer."""
         temp_buffer = bytearray()
         
         while self.running:
-            # We capture audio as long as the mic isn't explicitly muted.
-            # The VAD in the playback loop will gate the *use* of this audio.
-            if not self.capture_muted:
+            # Gate capture by the assistant_speaking flag to prevent echo.
+            if not self.assistant_speaking and not self.capture_muted:
                 try:
-                    # Non-blocking read from the microphone (reads a 5ms chunk)
+                    # Non-blocking read from the microphone
                     length, data = self.mic_pcm.read()
                     if length > 0:
                         temp_buffer.extend(data)
 
                     # If we have enough data for at least one 10ms chunk
                     while len(temp_buffer) >= CHUNK_SIZE:
-                        # Get one 10ms chunk and write it to the ring buffer
                         chunk_to_write = temp_buffer[:CHUNK_SIZE]
                         self.mic_buffer.write(chunk_to_write)
-                        
-                        # Remove the written chunk from our temp buffer
                         temp_buffer = temp_buffer[CHUNK_SIZE:]
 
                 except alsaaudio.ALSAAudioError as e:
@@ -259,43 +255,39 @@ class ALSAAudioManager:
                         self.logger.warning(f"Unhandled ALSA capture error: {e}")
 
             # Always sleep to prevent the non-blocking read from spinning the CPU.
-            # The capture period is 5ms. Sleeping for this duration is safe and efficient.
             time.sleep(0.005)
 
     def _playback_loop(self) -> None:
-        """Dedicated thread for audio playback and VAD."""
+        """Dedicated thread for audio playback and hardware-aware VAD."""
         while self.running:
             if not self.speaker_buffer.is_empty():
                 chunk = self.speaker_buffer.read()
-                if chunk is None:
-                    continue
-
-                try:
-                    self.speaker_pcm.write(chunk)
-                except alsaaudio.ALSAAudioError as e:
-                    self.logger.error(f"Playback error: {e}")
-                    # Consider what to do here, e.g., re-initialize speaker PCM
-                    continue
-
-                # VAD for controlling the assistant_speaking flag
-                energy = self._calculate_energy_fast(chunk)
-                if energy > SILENCE_THRESHOLD:
-                    if not self.assistant_speaking:
-                        self.logger.debug(f"Assistant started speaking (Energy: {energy:.2f})")
-                        self.assistant_speaking = True
-                    self.silence_counter = 0
-                else:  # Energy is low
-                    if self.assistant_speaking:
-                        self.silence_counter += 1
-                        # Wait for ~500ms of silence before disabling the flag
-                        if self.silence_counter > 25:  # 25 chunks * 20ms/chunk = 500ms
-                            self.logger.debug("Assistant stopped speaking")
-                            self.assistant_speaking = False
-                            # Reset counter once the state changes
-                            self.silence_counter = 0
+                if chunk:
+                    try:
+                        # VAD to turn on the speaking flag immediately
+                        energy = self._calculate_energy_fast(chunk)
+                        if energy > SILENCE_THRESHOLD and not self.assistant_speaking:
+                            self.logger.debug("VAD: Speech started.")
+                            self.assistant_speaking = True
+                        
+                        self.speaker_pcm.write(chunk)
+                    except alsaaudio.ALSAAudioError as e:
+                        self.logger.error(f"Playback error: {e}")
             else:
-                # Buffer is empty, sleep briefly to yield CPU
-                time.sleep(0.005)
+                # Our software buffer is empty. Now, check if the hardware buffer is also empty.
+                if self.assistant_speaking:
+                    try:
+                        # pcm.delay() returns the number of frames left in the hardware buffer.
+                        if self.speaker_pcm.delay() < PERIOD_SIZE:
+                            self.logger.debug("VAD: Hardware buffer drained, speech ended.")
+                            self.assistant_speaking = False
+                    except alsaaudio.ALSAAudioError:
+                        # If delay check fails, assume it's drained as a fallback.
+                        self.logger.warning("VAD: pcm.delay() failed, assuming speech ended.")
+                        self.assistant_speaking = False
+                
+                # Sleep briefly to yield CPU while waiting for more audio.
+                time.sleep(0.01)
     
     def _calculate_energy_fast(self, chunk: bytes) -> float:
         """Optimized energy calculation"""
