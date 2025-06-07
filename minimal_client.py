@@ -268,7 +268,17 @@ class ALSAAudioManager:
                 try:
                     self.speaker_pcm.write(chunk)
                 except alsaaudio.ALSAAudioError as e:
-                    self.logger.error(f"Playback error: {e}")
+                    # 'Broken pipe' is the classic error for a hardware buffer underrun.
+                    # This happens when the hardware buffer runs out of data to play.
+                    if 'Broken pipe' in str(e):
+                        self.logger.warning("HARDWARE UNDERRUN DETECTED. Attempting to recover stream.")
+                        try:
+                            # prepare() is used to recover the stream from an underrun state
+                            self.speaker_pcm.prepare()
+                        except alsaaudio.ALSAAudioError as prep_e:
+                            self.logger.error(f"Failed to recover ALSA stream after underrun: {prep_e}")
+                    else:
+                        self.logger.error(f"Unhandled playback error: {e}")
                     continue  # Skip processing for this chunk
 
                 energy = self._calculate_energy_fast(chunk)
@@ -289,7 +299,6 @@ class ALSAAudioManager:
 
             else:  # Buffer is empty
                 if self.assistant_speaking:
-                    self.logger.warning("Playback buffer empty during speech, inserting 10ms of silence.")
                     silence_chunks += 1
                 
                 # Yield CPU while idle.
