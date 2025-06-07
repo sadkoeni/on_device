@@ -256,36 +256,48 @@ class ALSAAudioManager:
 
     def _playback_loop(self) -> None:
         """Dedicated thread for audio playback and hardware-aware VAD."""
-        while self.running:
-            if not self.speaker_buffer.is_empty():
-                # We have audio to play.
-                # First, ensure the assistant is marked as speaking.
-                if not self.assistant_speaking:
-                    self.logger.debug("VAD: Playback started, assistant is now speaking.")
-                    self.assistant_speaking = True
+        silence_counter = 0
 
+        while self.running:
+            chunk_processed = False
+            if not self.speaker_buffer.is_empty():
+                chunk_processed = True
                 chunk = self.speaker_buffer.read()
                 if chunk:
+                    energy = self._calculate_energy_fast(chunk)
+
+                    if energy > SILENCE_THRESHOLD:
+                        if not self.assistant_speaking:
+                            self.logger.info("ASSISTANT SPEAKING: TRUE (VAD detected speech)")
+                            self.assistant_speaking = True
+                        silence_counter = 0
+                    else:  # Silent chunk
+                        if self.assistant_speaking:
+                            silence_counter += 1
+                    
                     try:
                         self.speaker_pcm.write(chunk)
                     except alsaaudio.ALSAAudioError as e:
                         self.logger.error(f"Playback error: {e}")
-            else:
-                # The software buffer is empty.
-                # If we were just speaking, this signifies the end of the utterance.
-                if self.assistant_speaking:
-                    self.logger.debug("VAD: Software buffer empty. Draining hardware buffer...")
-                    try:
-                        # This blocking call waits for the hardware to finish playing all sound.
-                        self.speaker_pcm.drain()
-                        self.logger.debug("VAD: Hardware buffer drained. Speech has ended.")
-                    except alsaaudio.ALSAAudioError as e:
-                        self.logger.warning(f"VAD: pcm.drain() failed: {e}")
-                    finally:
-                        # This is the only safe place to re-enable the microphone.
-                        self.assistant_speaking = False
-                
-                # Sleep to yield the CPU while waiting for more audio.
+
+            # End of utterance is detected by either sustained silence or the buffer running dry.
+            end_of_utterance = (self.assistant_speaking and silence_counter > 25) or \
+                               (self.assistant_speaking and not chunk_processed)
+
+            if end_of_utterance:
+                self.logger.debug("VAD: End of utterance detected. Draining hardware buffer...")
+                try:
+                    self.speaker_pcm.drain()
+                    self.logger.debug("VAD: Hardware buffer drained.")
+                except alsaaudio.ALSAAudioError as e:
+                    self.logger.warning(f"VAD: pcm.drain() failed: {e}")
+                finally:
+                    self.logger.info("ASSISTANT SPEAKING: FALSE (End of speech and drain complete)")
+                    self.assistant_speaking = False
+                    silence_counter = 0
+            
+            # Yield the CPU if no audio was processed in this loop iteration.
+            if not chunk_processed:
                 time.sleep(0.01)
 
     def _calculate_energy_fast(self, chunk: bytes) -> float:
