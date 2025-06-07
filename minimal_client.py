@@ -255,52 +255,56 @@ class ALSAAudioManager:
             time.sleep(0.005)
 
     def _playback_loop(self) -> None:
-        """Dedicated thread for audio playback and hardware-aware VAD."""
+        """Dedicated thread for audio playback. Mirrors the logic from the robust standalone_client."""
         silence_chunks = 0
+        min_speech_chunks = 3  # Require at least 30ms of speech before allowing end of speech detection
+        speech_chunk_count = 0
+
         while self.running:
-            if not self.speaker_buffer.is_empty():
-                chunk = self.speaker_buffer.read()
-                if not chunk: continue
+            chunk = self.speaker_buffer.read()
 
+            if chunk:
+                # Always write the chunk to the speaker to maintain timing.
                 try:
-                    # Always write the chunk to the speaker to maintain timing.
                     self.speaker_pcm.write(chunk)
-                    
-                    energy = self._calculate_energy_fast(chunk)
-
-                    if energy > SILENCE_THRESHOLD:
-                        if not self.assistant_speaking:
-                            self.logger.info("ASSISTANT SPEAKING: TRUE (VAD detected speech)")
-                            self.assistant_speaking = True
-                        silence_chunks = 0
-                    else: # Silent chunk
-                        if self.assistant_speaking:
-                            silence_chunks += 1
                 except alsaaudio.ALSAAudioError as e:
                     self.logger.error(f"Playback error: {e}")
+                    continue  # Skip processing for this chunk
 
-                # Check for end of utterance due to sustained silence.
-                if self.assistant_speaking and silence_chunks > 25:
-                    self.logger.debug("VAD: End of speech by silence. Draining.")
-                    try:
-                        self.speaker_pcm.drain()
-                    finally:
-                        self.logger.info("ASSISTANT SPEAKING: FALSE (Silence and drain complete)")
-                        self.assistant_speaking = False
-                        silence_chunks = 0
-            else: # Buffer is empty
-                # If we were speaking and the buffer runs dry, the utterance is over.
+                energy = self._calculate_energy_fast(chunk)
+
+                if energy > SILENCE_THRESHOLD:
+                    # Speech detected
+                    if not self.assistant_speaking:
+                        self.logger.info("ASSISTANT SPEAKING: TRUE (VAD detected speech)")
+                        self.assistant_speaking = True
+                    
+                    silence_chunks = 0
+                    speech_chunk_count += 1
+                else:
+                    # Silence detected
+                    if self.assistant_speaking:
+                        silence_chunks += 1
+
+            else:  # Buffer is empty
                 if self.assistant_speaking:
-                    self.logger.debug("VAD: End of speech by empty buffer. Draining.")
-                    try:
-                        self.speaker_pcm.drain()
-                    finally:
-                        self.logger.info("ASSISTANT SPEAKING: FALSE (Buffer empty and drain complete)")
-                        self.assistant_speaking = False
-                        silence_chunks = 0
+                    silence_chunks += 1
                 
                 # Yield CPU while idle.
                 time.sleep(0.01)
+
+            # Unified End-of-Speech Check
+            # Only consider ending speech if we have actually been speaking for a minimum duration.
+            # This prevents premature endings right at the start of an utterance.
+            if self.assistant_speaking and silence_chunks > 25 and speech_chunk_count > min_speech_chunks:
+                self.logger.debug(f"VAD: End of speech detected after {silence_chunks} silent intervals. Draining.")
+                try:
+                    self.speaker_pcm.drain()
+                finally:
+                    self.logger.info("ASSISTANT SPEAKING: FALSE (Silence/empty buffer and drain complete)")
+                    self.assistant_speaking = False
+                    silence_chunks = 0
+                    speech_chunk_count = 0
 
     def _calculate_energy_fast(self, chunk: bytes) -> float:
         """Optimized energy calculation"""
