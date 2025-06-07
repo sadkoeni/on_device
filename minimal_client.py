@@ -256,54 +256,56 @@ class ALSAAudioManager:
 
     def _playback_loop(self) -> None:
         """Dedicated thread for audio playback and hardware-aware VAD."""
-        silence_counter = 0
-
+        silence_chunks = 0
         while self.running:
-            chunk_processed = False
             if not self.speaker_buffer.is_empty():
-                chunk_processed = True
                 chunk = self.speaker_buffer.read()
-                if chunk:
+                if not chunk: continue
+
+                try:
+                    # Always write the chunk to the speaker to maintain timing.
+                    self.speaker_pcm.write(chunk)
+                    
                     energy = self._calculate_energy_fast(chunk)
 
                     if energy > SILENCE_THRESHOLD:
                         if not self.assistant_speaking:
                             self.logger.info("ASSISTANT SPEAKING: TRUE (VAD detected speech)")
                             self.assistant_speaking = True
-                        silence_counter = 0
-                    else:  # Silent chunk
+                        silence_chunks = 0
+                    else: # Silent chunk
                         if self.assistant_speaking:
-                            silence_counter += 1
-                    
-                    try:
-                        self.speaker_pcm.write(chunk)
-                    except alsaaudio.ALSAAudioError as e:
-                        self.logger.error(f"Playback error: {e}")
-
-            # End of utterance is detected by either sustained silence or the buffer running dry.
-            end_of_utterance = (self.assistant_speaking and silence_counter > 25) or \
-                               (self.assistant_speaking and not chunk_processed)
-
-            if end_of_utterance:
-                self.logger.debug("VAD: End of utterance detected. Draining hardware buffer...")
-                try:
-                    self.speaker_pcm.drain()
-                    self.logger.debug("VAD: Hardware buffer drained.")
+                            silence_chunks += 1
                 except alsaaudio.ALSAAudioError as e:
-                    self.logger.warning(f"VAD: pcm.drain() failed: {e}")
-                finally:
-                    self.logger.info("ASSISTANT SPEAKING: FALSE (End of speech and drain complete)")
-                    self.assistant_speaking = False
-                    silence_counter = 0
-            
-            # Yield the CPU if no audio was processed in this loop iteration.
-            if not chunk_processed:
+                    self.logger.error(f"Playback error: {e}")
+
+                # Check for end of utterance due to sustained silence.
+                if self.assistant_speaking and silence_chunks > 25:
+                    self.logger.debug("VAD: End of speech by silence. Draining.")
+                    try:
+                        self.speaker_pcm.drain()
+                    finally:
+                        self.logger.info("ASSISTANT SPEAKING: FALSE (Silence and drain complete)")
+                        self.assistant_speaking = False
+                        silence_chunks = 0
+            else: # Buffer is empty
+                # If we were speaking and the buffer runs dry, the utterance is over.
+                if self.assistant_speaking:
+                    self.logger.debug("VAD: End of speech by empty buffer. Draining.")
+                    try:
+                        self.speaker_pcm.drain()
+                    finally:
+                        self.logger.info("ASSISTANT SPEAKING: FALSE (Buffer empty and drain complete)")
+                        self.assistant_speaking = False
+                        silence_chunks = 0
+                
+                # Yield CPU while idle.
                 time.sleep(0.01)
 
     def _calculate_energy_fast(self, chunk: bytes) -> float:
         """Optimized energy calculation"""
-        # Sample every 20th value for speed
-        samples = np.frombuffer(chunk[::40], dtype=np.int16)
+        # Sample every 16th sample (32nd byte) for speed, as requested.
+        samples = np.frombuffer(chunk[::32], dtype=np.int16)
         return float(np.mean(np.abs(samples))) if len(samples) > 0 else 0.0
 
 
