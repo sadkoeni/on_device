@@ -272,6 +272,7 @@ class ALSAAudioManager:
                     continue  # Skip processing for this chunk
 
                 energy = self._calculate_energy_fast(chunk)
+                self.logger.debug(f"Playback chunk energy: {energy:.2f}")
 
                 if energy > SILENCE_THRESHOLD:
                     # Speech detected
@@ -301,6 +302,8 @@ class ALSAAudioManager:
                 try:
                     self.speaker_pcm.drain()
                 finally:
+                    # CRITICAL: Clear the buffer of any audio that arrived while we were draining.
+                    self.speaker_buffer.clear()
                     self.logger.info("ASSISTANT SPEAKING: FALSE (Silence/empty buffer and drain complete)")
                     self.assistant_speaking = False
                     silence_chunks = 0
@@ -308,8 +311,11 @@ class ALSAAudioManager:
 
     def _calculate_energy_fast(self, chunk: bytes) -> float:
         """Optimized energy calculation"""
-        # Sample every 16th sample (32nd byte) for speed, as requested.
-        samples = np.frombuffer(chunk[::32], dtype=np.int16)
+        # The previous method of sampling every 16th frame was too aggressive
+        # and misclassified quiet speech as silence.
+        # This now mirrors the robust implementation from the standalone client,
+        # analyzing the entire chunk for an accurate energy reading.
+        samples = np.frombuffer(chunk, dtype=np.int16)
         return float(np.mean(np.abs(samples))) if len(samples) > 0 else 0.0
 
 
