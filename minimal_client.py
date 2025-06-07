@@ -123,9 +123,6 @@ class ALSAAudioManager:
         self.capture_muted = False
         self.assistant_speaking = False  # Critical flag for echo prevention
         
-        # VAD state (for end-of-speech only)
-        self.silence_counter = 0
-        
         # ALSA devices (will be initialized in start())
         self.mic_pcm: Optional[alsaaudio.PCM] = None
         self.speaker_pcm: Optional[alsaaudio.PCM] = None
@@ -259,34 +256,51 @@ class ALSAAudioManager:
 
     def _playback_loop(self) -> None:
         """Dedicated thread for audio playback and hardware-aware VAD."""
+        assistant_silence_counter = 0
+        
         while self.running:
             if not self.speaker_buffer.is_empty():
                 chunk = self.speaker_buffer.read()
                 if chunk:
                     try:
-                        # VAD to turn on the speaking flag immediately
+                        # VAD check on the incoming chunk
                         energy = self._calculate_energy_fast(chunk)
-                        if energy > SILENCE_THRESHOLD and not self.assistant_speaking:
-                            self.logger.debug("VAD: Speech started.")
-                            self.assistant_speaking = True
+                        if energy > SILENCE_THRESHOLD:
+                            # This is speech. If we weren't speaking, we are now.
+                            if not self.assistant_speaking:
+                                self.logger.debug("VAD: Speech started.")
+                                self.assistant_speaking = True
+                            # Reset silence counter on any speech chunk
+                            assistant_silence_counter = 0
+                        else:
+                            # This is a silent chunk.
+                            if self.assistant_speaking:
+                                # If we were speaking, increment the silence counter.
+                                assistant_silence_counter += 1
                         
                         self.speaker_pcm.write(chunk)
                     except alsaaudio.ALSAAudioError as e:
                         self.logger.error(f"Playback error: {e}")
-            else:
-                # Our software buffer is empty. Now, check if the hardware buffer is also empty.
-                if self.assistant_speaking:
-                    try:
-                        # pcm.getframedelay() returns the number of frames of delay in the hardware buffer.
-                        if self.speaker_pcm.getframedelay() < PERIOD_SIZE:
-                            self.logger.debug("VAD: Hardware buffer drained, speech ended.")
-                            self.assistant_speaking = False
-                    except alsaaudio.ALSAAudioError:
-                        # If delay check fails, assume it's drained as a fallback.
-                        self.logger.warning("VAD: pcm.getframedelay() failed, assuming speech ended.")
+
+                # Check if the assistant has been silent for long enough
+                # A threshold of 25 chunks equals ~250ms of silence.
+                if assistant_silence_counter > 25:
+                    if self.assistant_speaking:
+                        self.logger.debug("VAD: End of utterance detected by silence.")
+                        try:
+                            # We've received enough silence. Drain the hardware buffer.
+                            self.speaker_pcm.drain()
+                            self.logger.debug("VAD: Hardware buffer drained.")
+                        except alsaaudio.ALSAAudioError as e:
+                            self.logger.warning(f"VAD: pcm.drain() failed: {e}")
+                        
+                        # Now that everything has been played, speech has ended.
                         self.assistant_speaking = False
-                
-                # Sleep briefly to yield CPU while waiting for more audio.
+                    
+                    # Reset counter after handling the end of speech
+                    assistant_silence_counter = 0
+            else:
+                # Buffer is empty, sleep briefly to yield CPU.
                 time.sleep(0.01)
     
     def _calculate_energy_fast(self, chunk: bytes) -> float:
