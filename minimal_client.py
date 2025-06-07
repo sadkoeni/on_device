@@ -37,7 +37,10 @@ CHUNK_SIZE = 960  # 20ms at 48kHz
 PERIOD_SIZE = 480  # 10ms periods
 SILENCE_THRESHOLD = 20
 LIVEKIT_URL = os.getenv("LIVEKIT_URL", "wss://lb-ub8o0q4v.livekit.cloud")
+<<<<<<< Updated upstream
 AUTH_API_URL = "https://lightberry.vercel.app/api/authenticate/{}"
+=======
+>>>>>>> Stashed changes
 
 # Simple state enum
 class State(Enum):
