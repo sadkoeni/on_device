@@ -277,13 +277,13 @@ class ALSAAudioManager:
                 # Our software buffer is empty. Now, check if the hardware buffer is also empty.
                 if self.assistant_speaking:
                     try:
-                        # pcm.getdelay() returns the number of frames of delay in the hardware buffer.
-                        if self.speaker_pcm.getdelay() < PERIOD_SIZE:
+                        # pcm.getframedelay() returns the number of frames of delay in the hardware buffer.
+                        if self.speaker_pcm.getframedelay() < PERIOD_SIZE:
                             self.logger.debug("VAD: Hardware buffer drained, speech ended.")
                             self.assistant_speaking = False
                     except alsaaudio.ALSAAudioError:
                         # If delay check fails, assume it's drained as a fallback.
-                        self.logger.warning("VAD: pcm.getdelay() failed, assuming speech ended.")
+                        self.logger.warning("VAD: pcm.getframedelay() failed, assuming speech ended.")
                         self.assistant_speaking = False
                 
                 # Sleep briefly to yield CPU while waiting for more audio.
