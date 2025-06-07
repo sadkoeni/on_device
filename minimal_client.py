@@ -257,7 +257,7 @@ class ALSAAudioManager:
     def _playback_loop(self) -> None:
         """Dedicated thread for audio playback. Mirrors the logic from the robust standalone_client."""
         silence_chunks = 0
-        min_speech_chunks = 3  # Require at least 30ms of speech before allowing end of speech detection
+        min_speech_chunks = 10  # Require at least 100ms of speech before allowing end of speech detection
         speech_chunk_count = 0
 
         while self.running:
@@ -297,7 +297,7 @@ class ALSAAudioManager:
             # Unified End-of-Speech Check
             # Only consider ending speech if we have actually been speaking for a minimum duration.
             # This prevents premature endings right at the start of an utterance.
-            if self.assistant_speaking and silence_chunks > 25 and speech_chunk_count > min_speech_chunks:
+            if self.assistant_speaking and silence_chunks > 50 and speech_chunk_count > min_speech_chunks:
                 self.logger.debug(f"VAD: End of speech detected after {silence_chunks} silent intervals. Draining.")
                 try:
                     self.speaker_pcm.drain()
