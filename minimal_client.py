@@ -289,6 +289,7 @@ class ALSAAudioManager:
 
             else:  # Buffer is empty
                 if self.assistant_speaking:
+                    self.logger.warning("Playback buffer empty during speech, inserting 10ms of silence.")
                     silence_chunks += 1
                 
                 # Yield CPU while idle.
