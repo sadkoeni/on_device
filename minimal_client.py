@@ -118,13 +118,13 @@ class ALSAAudioManager:
         self.assistant_speaking = False  # Critical flag for echo prevention
         
         # VAD state (for end-of-speech only)
-        self.vad_counter = 0
         self.silence_counter = 0
         
         # ALSA devices (will be initialized in start())
         self.mic_pcm: Optional[alsaaudio.PCM] = None
         self.speaker_pcm: Optional[alsaaudio.PCM] = None
-        self.audio_thread: Optional[threading.Thread] = None
+        self.capture_thread: Optional[threading.Thread] = None
+        self.playback_thread: Optional[threading.Thread] = None
         
         # Pre-allocate work buffers
         self._capture_buffer = bytearray(CHUNK_SIZE)
@@ -157,16 +157,22 @@ class ALSAAudioManager:
                 periodsize=PERIOD_SIZE
             )
             
-            # Start single audio thread
+            # Start dedicated audio threads
             self.running = True
-            self.audio_thread = threading.Thread(
-                target=self._audio_loop,
+            self.capture_thread = threading.Thread(
+                target=self._capture_loop,
                 daemon=True,
-                name="AudioThread"
+                name="CaptureThread"
             )
-            self.audio_thread.start()
+            self.playback_thread = threading.Thread(
+                target=self._playback_loop,
+                daemon=True,
+                name="PlaybackThread"
+            )
+            self.capture_thread.start()
+            self.playback_thread.start()
             
-            self.logger.info("Audio system started - 20ms max latency")
+            self.logger.info("Audio system started with dedicated I/O threads")
             
         except Exception as e:
             self.logger.error(f"Failed to start audio: {e}")
@@ -177,8 +183,10 @@ class ALSAAudioManager:
         self.logger.info("Stopping audio system...")
         self.running = False
         
-        if self.audio_thread:
-            self.audio_thread.join(timeout=2.0)
+        if self.capture_thread:
+            self.capture_thread.join(timeout=1.0)
+        if self.playback_thread:
+            self.playback_thread.join(timeout=1.0)
             
         if self.mic_pcm:
             self.mic_pcm.close()
@@ -188,12 +196,8 @@ class ALSAAudioManager:
         self.logger.info("Audio system stopped")
     
     def receive_audio_from_livekit(self, chunk: bytes) -> None:
-        """Called when assistant audio arrives - PREDICTIVE FLAG SET HERE"""
-        # CRITICAL: Set flag IMMEDIATELY - before audio plays
-        self.assistant_speaking = True
-        self.silence_counter = 0
-        
-        # Queue for playback
+        """Called when assistant audio arrives. VAD in playback loop handles state."""
+        # CRITICAL: Flag is NOT set here. Let the playback VAD handle it.
         self.speaker_buffer.write(chunk)
     
     def set_capture_muted(self, muted: bool) -> None:
@@ -216,54 +220,64 @@ class ALSAAudioManager:
         duration = len(wav_data) / (SAMPLE_RATE * 2)  # 2 bytes per sample
         await asyncio.sleep(duration)
     
-    def _audio_loop(self) -> None:
-        """Single thread for all audio I/O"""
+    def _capture_loop(self) -> None:
+        """Dedicated thread for audio capture."""
         consecutive_read_errors = 0
-        
         while self.running:
-            # CAPTURE - gated by assistant_speaking flag
             if not self.assistant_speaking and not self.capture_muted:
                 try:
                     length, data = self.mic_pcm.read()
                     if length > 0:
                         self.mic_buffer.write(data)
                         consecutive_read_errors = 0
+                    elif length == 0:
+                        time.sleep(0.005)  # Sleep briefly if no data to avoid spinning
                 except alsaaudio.ALSAAudioError as e:
                     if e.errno == -32:  # Broken pipe
                         consecutive_read_errors += 1
                         if consecutive_read_errors > 10:
                             self.logger.error("Too many ALSA errors, reinitializing...")
-                            # Could reinitialize here
-                    elif e.errno != -11:  # Ignore EAGAIN
+                            # In a real scenario, you might attempt to re-initialize the PCM device here.
+                    elif e.errno != -11:  # Ignore EAGAIN (Resource temporarily unavailable)
                         self.logger.debug(f"Capture error: {e}")
-            
-            # PLAYBACK - always process if available
+            else:
+                # Sleep if assistant is speaking or mic is muted
+                time.sleep(0.01)
+
+    def _playback_loop(self) -> None:
+        """Dedicated thread for audio playback and VAD."""
+        while self.running:
             if not self.speaker_buffer.is_empty():
                 chunk = self.speaker_buffer.read()
-                
-                # Always play immediately (no delay)
+                if chunk is None:
+                    continue
+
                 try:
                     self.speaker_pcm.write(chunk)
                 except alsaaudio.ALSAAudioError as e:
                     self.logger.error(f"Playback error: {e}")
-                
-                # VAD for end-of-speech only (can be lazy)
-                self.vad_counter += 1
-                if self.vad_counter % 5 == 0:  # Every 50ms
-                    energy = self._calculate_energy_fast(chunk)
-                    
-                    if energy < SILENCE_THRESHOLD:
+                    # Consider what to do here, e.g., re-initialize speaker PCM
+                    continue
+
+                # VAD for controlling the assistant_speaking flag
+                energy = self._calculate_energy_fast(chunk)
+                if energy > SILENCE_THRESHOLD:
+                    if not self.assistant_speaking:
+                        self.logger.debug(f"Assistant started speaking (Energy: {energy:.2f})")
+                        self.assistant_speaking = True
+                    self.silence_counter = 0
+                else:  # Energy is low
+                    if self.assistant_speaking:
                         self.silence_counter += 1
-                        if self.silence_counter > 4:  # 200ms silence
-                            if self.assistant_speaking:
-                                self.logger.debug("Assistant stopped speaking")
+                        # Wait for ~500ms of silence before disabling the flag
+                        if self.silence_counter > 25:  # 25 chunks * 20ms/chunk = 500ms
+                            self.logger.debug("Assistant stopped speaking")
                             self.assistant_speaking = False
+                            # Reset counter once the state changes
                             self.silence_counter = 0
-                    else:
-                        self.silence_counter = 0
-            
-            # Small sleep to prevent CPU spinning
-            time.sleep(0.001)
+            else:
+                # Buffer is empty, sleep briefly to yield CPU
+                time.sleep(0.005)
     
     def _calculate_energy_fast(self, chunk: bytes) -> float:
         """Optimized energy calculation"""
