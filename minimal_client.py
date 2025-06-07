@@ -63,10 +63,16 @@ class RingBuffer:
         self.read_idx = 0
         
     def write(self, data: bytes) -> None:
-        """Write data - overwrites old if full"""
+        """Write data - overwrites old if full. Pads with silence if data is smaller than chunk_size."""
         slot = self.buffer[self.write_idx]
         bytes_to_copy = min(len(data), self.chunk_size)
+        
+        # Copy the data into the start of the slot
         slot[:bytes_to_copy] = data[:bytes_to_copy]
+        
+        # If the incoming data was smaller than a full chunk, pad the rest with silence (0s)
+        if bytes_to_copy < self.chunk_size:
+            slot[bytes_to_copy:] = b'\x00' * (self.chunk_size - bytes_to_copy)
         
         # Atomic increment
         self.write_idx = (self.write_idx + 1) % self.size
@@ -196,9 +202,13 @@ class ALSAAudioManager:
         self.logger.info("Audio system stopped")
     
     def receive_audio_from_livekit(self, chunk: bytes) -> None:
-        """Called when assistant audio arrives. VAD in playback loop handles state."""
-        # CRITICAL: Flag is NOT set here. Let the playback VAD handle it.
-        self.speaker_buffer.write(chunk)
+        """Called when assistant audio arrives. Chunks it for the playback buffer."""
+        # A single 'frame' from LiveKit can contain multiple of our internal chunks.
+        chunk_size = self.speaker_buffer.chunk_size
+        for i in range(0, len(chunk), chunk_size):
+            sub_chunk = chunk[i:i + chunk_size]
+            # The write method now handles padding if sub_chunk is smaller than a full chunk.
+            self.speaker_buffer.write(sub_chunk)
     
     def set_capture_muted(self, muted: bool) -> None:
         """Mute/unmute microphone capture"""
@@ -211,9 +221,7 @@ class ALSAAudioManager:
         # In production, might want to mix with assistant audio
         for i in range(0, len(wav_data), CHUNK_SIZE):
             chunk = wav_data[i:i + CHUNK_SIZE]
-            if len(chunk) < CHUNK_SIZE:
-                # Pad with silence
-                chunk = chunk + self._empty_buffer[:CHUNK_SIZE - len(chunk)]
+            # The RingBuffer's write method will now handle padding if the chunk is small
             self.speaker_buffer.write(chunk)
         
         # Wait for playback to complete (rough estimate)
@@ -221,28 +229,38 @@ class ALSAAudioManager:
         await asyncio.sleep(duration)
     
     def _capture_loop(self) -> None:
-        """Dedicated thread for audio capture."""
-        consecutive_read_errors = 0
+        """Dedicated thread for audio capture. It reads 5ms chunks from ALSA
+        and assembles them into 10ms chunks for the ring buffer."""
+        temp_buffer = bytearray()
+        
         while self.running:
-            if not self.assistant_speaking and not self.capture_muted:
+            # We capture audio as long as the mic isn't explicitly muted.
+            # The VAD in the playback loop will gate the *use* of this audio.
+            if not self.capture_muted:
                 try:
+                    # Non-blocking read from the microphone (reads a 5ms chunk)
                     length, data = self.mic_pcm.read()
                     if length > 0:
-                        self.mic_buffer.write(data)
-                        consecutive_read_errors = 0
-                    elif length == 0:
-                        time.sleep(0.005)  # Sleep briefly if no data to avoid spinning
+                        temp_buffer.extend(data)
+
+                    # If we have enough data for at least one 10ms chunk
+                    while len(temp_buffer) >= CHUNK_SIZE:
+                        # Get one 10ms chunk and write it to the ring buffer
+                        chunk_to_write = temp_buffer[:CHUNK_SIZE]
+                        self.mic_buffer.write(chunk_to_write)
+                        
+                        # Remove the written chunk from our temp buffer
+                        temp_buffer = temp_buffer[CHUNK_SIZE:]
+
                 except alsaaudio.ALSAAudioError as e:
-                    if e.errno == -32:  # Broken pipe
-                        consecutive_read_errors += 1
-                        if consecutive_read_errors > 10:
-                            self.logger.error("Too many ALSA errors, reinitializing...")
-                            # In a real scenario, you might attempt to re-initialize the PCM device here.
-                    elif e.errno != -11:  # Ignore EAGAIN (Resource temporarily unavailable)
-                        self.logger.debug(f"Capture error: {e}")
-            else:
-                # Sleep if assistant is speaking or mic is muted
-                time.sleep(0.01)
+                    if e.errno == -11:  # EAGAIN (Resource temporarily unavailable)
+                        pass  # This is normal, no data available, we will sleep below.
+                    else:
+                        self.logger.warning(f"Unhandled ALSA capture error: {e}")
+
+            # Always sleep to prevent the non-blocking read from spinning the CPU.
+            # The capture period is 5ms. Sleeping for this duration is safe and efficient.
+            time.sleep(0.005)
 
     def _playback_loop(self) -> None:
         """Dedicated thread for audio playback and VAD."""
