@@ -13,6 +13,9 @@ import wave
 from enum import Enum
 from typing import Optional, List
 from collections import deque
+import json
+import urllib.request
+import urllib.error
 
 # Minimal imports - only what we need
 import numpy as np
@@ -33,7 +36,8 @@ CHANNELS = 1
 CHUNK_SIZE = 960  # 20ms at 48kHz
 PERIOD_SIZE = 480  # 10ms periods
 SILENCE_THRESHOLD = 20
-LIVEKIT_URL = os.getenv("LIVEKIT_URL", "wss://your-livekit-server.com")
+LIVEKIT_URL = os.getenv("LIVEKIT_URL", "wss://lb-ub8o0q4v.livekit.cloud")
+AUTH_API_URL = "https://lightberry.vercel.app/api/authenticate/{}"
 
 # Simple state enum
 class State(Enum):
@@ -131,23 +135,23 @@ class ALSAAudioManager:
             self.mic_pcm = alsaaudio.PCM(
                 type=alsaaudio.PCM_CAPTURE,
                 mode=alsaaudio.PCM_NONBLOCK,
-                device='default'
+                device='default',
+                rate=SAMPLE_RATE,
+                channels=CHANNELS,
+                format=alsaaudio.PCM_FORMAT_S16_LE,
+                periodsize=PERIOD_SIZE
             )
-            self.mic_pcm.setchannels(CHANNELS)
-            self.mic_pcm.setrate(SAMPLE_RATE)
-            self.mic_pcm.setformat(alsaaudio.PCM_FORMAT_S16_LE)
-            self.mic_pcm.setperiodsize(PERIOD_SIZE)
             
             # Open speaker with normal mode
             self.speaker_pcm = alsaaudio.PCM(
                 type=alsaaudio.PCM_PLAYBACK,
                 mode=alsaaudio.PCM_NORMAL,
-                device='default'
+                device='default',
+                rate=SAMPLE_RATE,
+                channels=CHANNELS,
+                format=alsaaudio.PCM_FORMAT_S16_LE,
+                periodsize=PERIOD_SIZE
             )
-            self.speaker_pcm.setchannels(CHANNELS)
-            self.speaker_pcm.setrate(SAMPLE_RATE)
-            self.speaker_pcm.setformat(alsaaudio.PCM_FORMAT_S16_LE)
-            self.speaker_pcm.setperiodsize(PERIOD_SIZE)
             
             # Start single audio thread
             self.running = True
@@ -464,13 +468,46 @@ class MinimalLiveKitClient:
         self.logger.info("Disconnected from LiveKit")
     
     async def _get_credentials(self) -> str:
-        """Get LiveKit token - implement your auth here"""
-        # Simplified - in production, fetch from your auth server
+        """Get LiveKit token from the authentication server."""
         device_id = os.getenv("DEVICE_ID", "test-device")
-        
-        # For testing, you might generate a development token
-        # In production, fetch from your authentication API
-        return os.getenv("LIVEKIT_TOKEN", "your-dev-token")
+        username = "recDNsqLQ9CKswdVJ"  # From standalone_client.py for consistency
+
+        url = AUTH_API_URL.format(device_id)
+        payload_dict = {"username": username, "x-device-api-key": username}
+        payload_bytes = json.dumps(payload_dict).encode('utf-8')
+        headers = {'Content-Type': 'application/json'}
+
+        self.logger.info(f"Fetching token from {url} for device '{device_id}'")
+
+        def blocking_request():
+            req = urllib.request.Request(url, data=payload_bytes, headers=headers, method='POST')
+            try:
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    if response.status == 200:
+                        res_data = json.loads(response.read().decode('utf-8'))
+                        if res_data.get("success") and res_data.get("livekit_token"):
+                            self.logger.info("Successfully fetched LiveKit token.")
+                            return res_data["livekit_token"]
+                    self.logger.error(f"Auth server returned status {response.status}: {response.read().decode('utf-8')}")
+            except urllib.error.URLError as e:
+                self.logger.error(f"Auth request failed: {e.reason}")
+            except json.JSONDecodeError:
+                self.logger.error("Failed to decode auth server response.")
+            except Exception as e:
+                self.logger.error(f"Unexpected error fetching token: {e}")
+            return None
+
+        loop = asyncio.get_running_loop()
+        token = await loop.run_in_executor(None, blocking_request)
+
+        if token:
+            return token
+        else:
+            self.logger.warning("API token fetch failed. Falling back to LIVEKIT_TOKEN env var.")
+            fallback_token = os.getenv("LIVEKIT_TOKEN")
+            if not fallback_token:
+                raise ConnectionError("Failed to get token from API and LIVEKIT_TOKEN env var is not set.")
+            return fallback_token
     
     async def _forward_mic(self) -> None:
         """Forward microphone audio to LiveKit"""
